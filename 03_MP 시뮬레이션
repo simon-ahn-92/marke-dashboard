@@ -1,0 +1,3137 @@
+# -*- coding: utf-8 -*-
+"""
+포트폴리오_MP.py
+DTW 추천 비중 → 모델 포트폴리오 구성 + 내러티브 틸팅 + 백테스트
+"""
+
+import sys, io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+import ssl, urllib3
+ssl._create_default_https_context = ssl._create_unverified_context
+urllib3.disable_warnings()
+
+import json
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from scipy import stats as sp_stats
+from dtaidistance import dtw as dtw_lib
+from scipy.optimize import minimize as sp_minimize
+import warnings
+warnings.filterwarnings("ignore")
+
+
+# ═══════════════════════════════════════════════
+# 설정
+# ═══════════════════════════════════════════════
+BASE_DIR     = Path(r"C:\python\성일\국면판단 모델")
+RESULT_PATH  = BASE_DIR / "국면판단_결과_v2.xlsx"
+FRED_PATH    = BASE_DIR / "국면판단_원데이터.xlsx"
+OUTPUT_PATH  = BASE_DIR / "국면판단_포트폴리오_MP.html"
+START_DATE   = "2000-01-01"
+TRAIN_END_DATE   = "2025-12-31"
+INFER_START_DATE = "2026-01-01"
+
+# DTW 설정 (시각화_05와 동일 + 국면판단_v2 신규 지표 반영)
+DTW_WINDOW      = 12
+DTW_TOP_N       = 5
+DTW_MIN_HISTORY = 36
+DTW_EXCLUDE     = 24
+DTW_PCTILE_WIN  = 60
+DTW_INDICATORS  = [
+    "VIX", "장단기금리차(10Y-2Y)", "HY크레딧스프레드",
+    "미국CPI", "실질금리TIPS10Y", "달러인덱스DXY",
+    "SP500", "미국실업률", "금현물가격", "WTI원유",
+    # 국면판단_v2 신규 추가
+    "Sahm룰침체지표", "IG크레딧스프레드", "산업생산지수", "근원PCE",
+]
+DTW_FWD_MONTHS = [3, 6, 12]
+
+# 최적 배분 대상 스타일 (경기민감 제외)
+OPTIMAL_STYLES = ["성장주", "가치주", "방어주", "현금", "대체자산", "종합채"]
+
+STYLE_ETFS = {
+    "성장주": [("QQQ","QQQ.US"), ("VUG","VUG.US"), ("IWF","IWF.US")],
+    "가치주": [("VTV","VTV.US"), ("IWD","IWD.US"), ("IVE","IVE.US")],
+    "방어주": [("XLP","XLP.US"), ("XLU","XLU.US"), ("XLV","XLV.US")],
+    "현금":   [("SHV","SHV.US"), ("BIL","BIL.US")],
+    "대체자산": [("GLD","GLD.US"), ("TIP","TIP.US")],
+    "종합채": [("AGG","AGG.US")],
+}
+
+# ─────────────────────────────────────────────
+# Core 포트폴리오: 스타일 → 대표 ETF 서브배분
+# ─────────────────────────────────────────────
+BASE_ETF_SUB = {
+    "성장주": {"QQQ": 1.00},
+    "가치주": {"VTV": 0.60, "IWD": 0.40},
+    "방어주": {"XLV": 0.50, "XLP": 0.50},
+    "현금":   {"SHV": 0.70, "BIL": 0.30},
+    "대체자산": {"GLD": 0.70, "TIP": 0.30},
+    "종합채": {"AGG": 1.00},
+}
+
+BASE_ETF_INFO = {
+    "QQQ": ("Invesco QQQ Trust",                 "나스닥-100",           0.20),
+    "VUG": ("Vanguard Growth ETF",               "미국 성장주",           0.04),
+    "IWF": ("iShares Russell 1000 Growth",       "러셀 성장주",           0.19),
+    "VTV": ("Vanguard Value ETF",                "미국 가치주",           0.04),
+    "IWD": ("iShares Russell 1000 Value",        "러셀 가치주",           0.19),
+    "IVE": ("iShares S&P 500 Value",             "S&P500 가치주",         0.18),
+    "XLV": ("Health Care Select Sector SPDR",    "헬스케어",              0.09),
+    "XLP": ("Consumer Staples Select Sector",    "필수소비재",            0.09),
+    "XLU": ("Utilities Select Sector SPDR",      "유틸리티",              0.09),
+    "XLI": ("Industrial Select Sector SPDR",     "산업재",                0.09),
+    "XLE": ("Energy Select Sector SPDR",         "에너지",                0.09),
+    "XLY": ("Consumer Discretionary Select",     "임의소비재",            0.09),
+    "SHV": ("iShares Short Treasury Bond ETF",   "초단기 국채(1개월 이하)", 0.15),
+    "BIL": ("SPDR Bloomberg 1-3 Month T-Bill",   "1-3개월 T-Bill",        0.14),
+    "GLD": ("SPDR Gold Shares",                  "금 현물",               0.40),
+    "TIP": ("iShares TIPS Bond ETF",             "물가연동채",            0.19),
+    "SPY": ("SPDR S&P 500 ETF Trust",            "S&P500",                0.09),
+    "AGG": ("iShares Core U.S. Aggregate Bond",  "미국 전구간 채권",      0.03),
+}
+
+STYLE_COLORS = {
+    "성장주": "#3498db",
+    "가치주": "#2ecc71",
+    "방어주": "#9b59b6",
+    "현금":   "#95a5a6",
+    "대체자산": "#f1c40f",
+    "종합채": "#1abc9c",
+    "혼합":   "#aaaaaa",
+}
+
+# ─────────────────────────────────────────────
+# 테마 ETF → 구체적 스타일 성격 매핑
+# ─────────────────────────────────────────────
+THEME_ETF_STYLE = {
+    # 벤치마크
+    "SPY":  "혼합",
+    # 성장주 계열: 반도체·AI·기술혁신·바이오 (고성장·고변동성)
+    "SOXX": "성장주",  # 반도체
+    "SMH":  "성장주",  # 반도체
+    "BOTZ": "성장주",  # AI/로봇
+    "AIQ":  "성장주",  # AI/기술
+    "ARKK": "성장주",  # 혁신 성장
+    "CIBR": "성장주",  # 사이버보안
+    "XBI":  "성장주",  # 바이오테크 (고성장)
+    "IBB":  "성장주",  # 바이오테크
+    # 가치주 계열: 금융·은행 (경기순환·배당)
+    "XLF":  "가치주",  # 금융 섹터
+    "VFH":  "가치주",  # 금융 ETF
+    # 방어주 계열: 방위·인프라·수자원 (안정적 수요)
+    "ITA":  "방어주",  # 방위/항공우주 (정부 계약 기반)
+    "XAR":  "방어주",  # 항공우주/방위
+    "PAVE": "방어주",  # 미국 인프라
+    "IGF":  "방어주",  # 글로벌 인프라
+    "PHO":  "방어주",  # 수자원
+    # 대체자산 계열: 원자재·귀금속
+    "GDX":  "대체자산",  # 금광주
+    "XME":  "대체자산",  # 금속/광업
+}
+
+# ─────────────────────────────────────────────
+# 테마형 ETF 그룹 (선택창용)
+# ─────────────────────────────────────────────
+THEME_ETF_GROUPS = {
+    "반도체":       [("SOXX","iShares Semiconductor ETF",130,4),
+                    ("SMH", "VanEck Semiconductor ETF",  250,4)],
+    "AI/기술":      [("BOTZ","Global X Robotics & AI",   27,3),
+                    ("AIQ", "Global X AI & Technology",  18,3),
+                    ("ARKK","ARK Innovation ETF",         70,3)],
+    "사이버보안":   [("CIBR","First Trust Cybersecurity", 70,4),
+                    ("HACK","ETFMG Cyber Security",       18,3)],
+    "헬스케어/바이오":[("XBI","SPDR S&P Biotech",         80,3),
+                     ("IBB","iShares Biotechnology",      75,3)],
+    "금융":         [("XLF","Financial Select SPDR",     470,4),
+                    ("VFH","Vanguard Financials ETF",     120,5)],
+    "방위/항공우주":[("ITA","iShares Aerospace & Defense",60,4),
+                    ("XAR","SPDR Aerospace & Defense",    14,4)],
+    "인프라":       [("PAVE","Global X US Infrastructure",75,4),
+                    ("IGF","iShares Global Infrastructure",50,4)],
+    "원자재/광업":  [("GDX","VanEck Gold Miners ETF",    160,3),
+                    ("XME","SPDR Metals & Mining ETF",    18,3)],
+    "수자원":       [("PHO","Invesco Water Resources",    18,4),],
+}
+
+# ─────────────────────────────────────────────
+# 내러티브 틸팅: 슬라이더 1단위당 스타일 비중 변화(%p)
+# ─────────────────────────────────────────────
+TILT_EFFECTS = {
+    "달러": {          # +: 강세, -: 약세
+        "성장주": +4.0,   # 달러 강세 → 미국 대형 성장주 유리
+        "가치주": +2.0,
+        "방어주":  0.0,
+        "현금":   +2.0,   # 달러 강세 → 달러 현금 매력↑
+        "대체자산": -2.0,  # 달러 강세 → 금/원자재 달러 기준 하락
+    },
+    "물가": {          # +: 상승, -: 하락
+        "성장주": -4.0,   # 물가 상승 → 금리↑ → 성장주 밸류에이션↓
+        "가치주": +2.0,
+        "방어주": +3.0,   # 필수소비재·유틸리티 물가전가 가능
+        "현금":   -3.0,   # 물가 상승 → 현금 실질가치↓
+        "대체자산": +4.0,  # 금·TIP → 최고의 물가 헤지
+    },
+    "금리": {          # +: 상승, -: 하락
+        "성장주": -5.0,   # 금리 상승 → 성장주 할인율↑
+        "가치주": +3.0,   # 가치주(금융 포함) 상대적 유리
+        "방어주": -1.0,   # 유틸리티 등 고배당주 부담↑
+        "현금":   +5.0,   # 금리 상승 → 단기 현금 수익률↑
+        "대체자산": -3.0,  # 금리 상승 → 금 기회비용 증가
+    },
+    "유가": {          # +: 상승, -: 하락
+        "성장주": -2.0,   # 유가 상승 → 소비 비용↑
+        "가치주":  0.0,
+        "방어주": +1.0,
+        "현금":   -2.0,   # 유가 상승 → 인플레 → 현금 실질가치↓
+        "대체자산": +2.0,  # 유가 상승 → 원자재 연동 상승
+    },
+    "지정학": {        # +: 위기, -: 안정
+        "성장주": -4.0,   # 지정학 위기 → 위험자산 회피
+        "가치주": -2.0,
+        "방어주": +3.0,   # 방어주 수요↑
+        "현금":   +5.0,   # 지정학 위기 → 현금 선호↑ (최대 안전자산)
+        "대체자산": +4.0,  # 지정학 위기 → 금 안전자산 역할 극대화
+    },
+}
+
+TILT_LABELS = {
+    "달러":   ("달러 약세", "달러 강세", "💵"),
+    "물가":   ("물가 하락", "물가 상승", "📈"),
+    "금리":   ("금리 하락", "금리 상승", "🏦"),
+    "유가":   ("유가 하락", "유가 상승", "🛢️"),
+    "지정학": ("지정학 안정", "지정학 위기", "🌍"),
+}
+
+REGIME_COLORS = {
+    "붐(강세)":       "#27ae60",
+    "골디락스":       "#2980b9",
+    "스태그플레이션": "#e67e22",
+    "침체(위기)":     "#c0392b",
+    "전환기(TRAN)":   "#9b59b6",
+    "미확정":         "#95a5a6",
+}
+
+
+# ═══════════════════════════════════════════════
+# 데이터 로딩
+# ═══════════════════════════════════════════════
+def load_all_prices() -> pd.DataFrame:
+    """
+    국면판단_원데이터.xlsx에서 ETF 가격 통합 로드
+      일간데이터 : 스타일 ETF (QQQ, VTV, XLV 등)
+      현금성ETF   : SHV, BIL
+      테마ETF     : SPY, SOXX 등 위성 ETF
+    """
+    xl = pd.ExcelFile(FRED_PATH)
+
+    # 스타일 ETF + 벤치마크(AGG) — 일간데이터 시트
+    daily = pd.read_excel(xl, sheet_name="일간데이터",
+                          index_col=0, parse_dates=True).sort_index()
+    style_tickers = [t for etfs in STYLE_ETFS.values() for t, _ in etfs]
+    bench_tickers = ["AGG"]   # 60/40 벤치마크용 (종합채 스타일에도 포함)
+    want_cols = list(dict.fromkeys(style_tickers + bench_tickers))  # 중복 제거
+    style_cols = [c for c in want_cols if c in daily.columns]
+    df = daily[style_cols].dropna(how="all")
+
+    # 현금성 ETF
+    if "현금성ETF" in xl.sheet_names:
+        cash_df = pd.read_excel(xl, sheet_name="현금성ETF",
+                                index_col=0, parse_dates=True).sort_index()
+        df = pd.concat([df, cash_df], axis=1)
+
+    # 테마 ETF
+    if "테마ETF" in xl.sheet_names:
+        theme_df = pd.read_excel(xl, sheet_name="테마ETF",
+                                 index_col=0, parse_dates=True).sort_index()
+        df = pd.concat([df, theme_df], axis=1)
+
+    df = df.loc[:, ~df.columns.duplicated(keep="last")]
+    print(f"  Excel 로드: {len(df.columns)}개 ETF "
+          f"({df.index[0].date()} ~ {df.index[-1].date()})")
+    return df.sort_index()
+
+
+def compute_monthly_returns(price_df: pd.DataFrame) -> pd.DataFrame:
+    monthly = price_df.resample("ME").last()
+    return monthly.pct_change().dropna(how="all")
+
+
+def build_returns_json(monthly_ret: pd.DataFrame) -> str:
+    """월별 수익률 → JavaScript 임베드용 JSON"""
+    ret = monthly_ret.copy()
+    ret.index = ret.index.to_period("M").to_timestamp("M")
+    dates = [d.strftime("%Y-%m-%d") for d in ret.index]
+    returns = {}
+    for col in ret.columns:
+        vals = ret[col].tolist()
+        returns[col] = [round(v, 6) if not np.isnan(v) else None for v in vals]
+    return json.dumps({"dates": dates, "returns": returns}, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════
+# DTW 최적 비중 계산 (시각화_05 로직 재사용)
+# ═══════════════════════════════════════════════
+def _max_sharpe(ret_df: pd.DataFrame,
+                per_bounds: list[tuple] | None = None) -> tuple[np.ndarray, float]:
+    n = ret_df.shape[1]
+    ret_arr = ret_df.fillna(0).values
+
+    def neg_sharpe(w):
+        port = ret_arr @ w
+        mean = port.mean() * 12
+        std  = port.std() * np.sqrt(12)
+        return -(mean / std) if std > 1e-8 else 0.0
+
+    constraints = [{"type": "eq", "fun": lambda w: w.sum() - 1}]
+    bounds = per_bounds if per_bounds else [(0.05, 0.65)] * n
+    best_w, best_sh = np.ones(n) / n, -np.inf
+    np.random.seed(42)
+    for _ in range(12):
+        x0 = np.clip(np.random.dirichlet(np.ones(n)),
+                     [b[0] for b in bounds], [b[1] for b in bounds])
+        x0 /= x0.sum()
+        try:
+            res = sp_minimize(neg_sharpe, x0, method="SLSQP",
+                              bounds=bounds, constraints=constraints,
+                              options={"maxiter": 500, "ftol": 1e-9})
+            if res.success and -res.fun > best_sh:
+                best_sh = -res.fun
+                best_w  = res.x
+        except Exception:
+            pass
+    best_w = np.where(best_w < 0.01, 0, best_w)
+    s = best_w.sum()
+    if s > 0: best_w /= s
+    return best_w, best_sh
+
+
+def dtw_load_macro() -> pd.DataFrame:
+    xl = pd.ExcelFile(FRED_PATH)
+    daily   = pd.read_excel(xl, sheet_name="일간데이터",
+                            index_col=0, parse_dates=True).sort_index()
+    monthly = pd.read_excel(xl, sheet_name="월간데이터",
+                            index_col=0, parse_dates=True).sort_index()
+    monthly_d = monthly.reindex(daily.index, method="ffill")
+    df = pd.concat([daily, monthly_d], axis=1)
+    df = df[~df.index.duplicated(keep="first")].sort_index()
+    if "금현물가격(USD/oz)" in df.columns and "금현물가격" not in df.columns:
+        df = df.rename(columns={"금현물가격(USD/oz)": "금현물가격"})
+    return df.resample("ME").last()
+
+
+def dtw_build_scores(macro: pd.DataFrame) -> pd.DataFrame:
+    cols = [c for c in DTW_INDICATORS if c in macro.columns]
+    result = {}
+    for col in cols:
+        s = macro[col].dropna()
+        diffs = s.diff(1)
+        pcts = []
+        for t in range(len(diffs)):
+            val = diffs.iloc[t]
+            if pd.isna(val):
+                pcts.append(np.nan)
+                continue
+            hist = diffs.iloc[max(0, t - DTW_PCTILE_WIN):t].dropna()
+            pcts.append(sp_stats.percentileofscore(hist, val, kind="rank") / 100
+                        if len(hist) >= 6 else 0.5)
+        result[col] = pd.Series(pcts, index=diffs.index)
+    return pd.DataFrame(result).dropna(how="all")
+
+
+def dtw_find_similar(scores: pd.DataFrame) -> list[tuple]:
+    infer_start = pd.Timestamp(INFER_START_DATE)
+    valid       = scores.dropna(how="all").index
+
+    # 추론 구간(현재): INFER_START_DATE 이후 — 비교 기준 윈도우
+    infer_idx = valid[valid >= infer_start]
+    # 학습 구간: INFER_START_DATE 이전 — 유사 구간 후보
+    train_idx = valid[valid < infer_start]
+
+    if len(infer_idx) < 1 or len(train_idx) < DTW_MIN_HISTORY:
+        return []
+
+    cur_window  = len(infer_idx)          # 추론 기간 길이 (현재 4개월)
+    current_win = scores.loc[infer_idx]
+    cols = [c for c in current_win.columns
+            if current_win[c].notna().sum() >= max(1, cur_window // 2)]
+    if not cols:
+        return []
+    cur_arr = current_win[cols].fillna(0.5).values.T
+
+    results = []
+    for i in range(cur_window, len(train_idx)):
+        end_d    = train_idx[i]
+        past_win = scores.loc[train_idx[i - cur_window: i], cols].fillna(0.5)
+        if len(past_win) < max(1, cur_window // 2):
+            continue
+        past_arr = past_win.values.T
+        dist_sum = sum(
+            dtw_lib.distance(cur_arr[ci].astype(np.double),
+                             past_arr[ci].astype(np.double))
+            for ci in range(len(cols))
+        )
+        sim = max(0.0, 100.0 * (1.0 - dist_sum / (len(cols) * cur_window)))
+        results.append((end_d, sim))
+
+    results.sort(key=lambda x: -x[1])
+    selected = []
+    for end_d, sim in results:
+        if not any(abs((end_d - s[0]).days) < cur_window * 30 for s in selected):
+            selected.append((end_d, sim))
+        if len(selected) >= DTW_TOP_N:
+            break
+    return selected
+
+
+def compute_dtw_optimal(monthly_ret: pd.DataFrame,
+                        similar: list[tuple],
+                        fwd: int = 12) -> tuple[dict, float, list]:
+    """유사 구간 +fwd개월 수익률 기반 최대 샤프 스타일 배분 (OPTIMAL_STYLES만 사용)"""
+    if not similar:
+        return {}, np.nan, similar
+
+    monthly_ret_idx = monthly_ret.index.to_period("M")
+    frames = []
+    for end_d, _sim in similar:
+        end_p    = end_d.to_period("M")
+        target_p = end_p + fwd
+        mask = (monthly_ret_idx > end_p) & (monthly_ret_idx <= target_p)
+        sub  = monthly_ret.loc[mask]
+        if sub.empty:
+            continue
+        style_cols = {}
+        for style, etfs in STYLE_ETFS.items():
+            if style not in OPTIMAL_STYLES:
+                continue
+            tickers = [t for t, _ in etfs if t in sub.columns]
+            if tickers:
+                grp = sub[tickers].mean(axis=1).dropna()
+                if not grp.empty:
+                    style_cols[style] = grp
+        if style_cols:
+            frames.append(pd.DataFrame(style_cols))
+
+    if not frames:
+        return {}, np.nan, similar
+
+    combined = pd.concat(frames, ignore_index=True).dropna(how="all").fillna(0)
+    if len(combined) < 6 or combined.shape[1] < 2:
+        return {}, np.nan, similar
+
+    styles = list(combined.columns)
+    # 현금은 30% 상한 적용 (과도한 현금 쏠림 방지)
+    per_bounds = [(0.05, 0.30) if s == "현금" else (0.05, 0.65) for s in styles]
+    weights, sharpe = _max_sharpe(combined, per_bounds=per_bounds)
+    opt_w = {s: round(w * 100, 1) for s, w in zip(styles, weights) if w >= 0.01}
+    return opt_w, round(sharpe, 2), similar
+
+
+def compute_all_dtw_allocs(monthly_ret: pd.DataFrame,
+                           similar: list[tuple],
+                           fwd: int = 12) -> tuple[dict, float]:
+    """
+    DTW 유사 구간 기반 4가지 배분 방식 계산
+    Returns: (all_allocs_dict, sharpe)
+      all_allocs_dict 키: "Sharpe최적", "비례배분", "집중형", "균등혼합", "_sharpe"
+    """
+    if not similar:
+        return {}, np.nan
+
+    monthly_ret_idx = monthly_ret.index.to_period("M")
+    frames = []
+    for end_d, _sim in similar:
+        end_p    = end_d.to_period("M")
+        target_p = end_p + fwd
+        mask = (monthly_ret_idx > end_p) & (monthly_ret_idx <= target_p)
+        sub  = monthly_ret.loc[mask]
+        if sub.empty:
+            continue
+        style_cols = {}
+        for style, etfs in STYLE_ETFS.items():
+            if style not in OPTIMAL_STYLES:
+                continue
+            tickers = [t for t, _ in etfs if t in sub.columns]
+            if tickers:
+                grp = sub[tickers].mean(axis=1).dropna()
+                if not grp.empty:
+                    style_cols[style] = grp
+        if style_cols:
+            frames.append(pd.DataFrame(style_cols))
+
+    if not frames:
+        return {}, np.nan
+
+    combined = pd.concat(frames, ignore_index=True).dropna(how="all").fillna(0)
+    if len(combined) < 6 or combined.shape[1] < 2:
+        return {}, np.nan
+
+    styles = list(combined.columns)
+
+    # Sharpe최적 — 종합채 최대 15% 제약
+    per_bounds = []
+    for s in styles:
+        if s == "현금":
+            per_bounds.append((0.05, 0.30))
+        elif s == "종합채":
+            per_bounds.append((0.0, 0.10))
+        else:
+            per_bounds.append((0.05, 0.65))
+    weights, sharpe = _max_sharpe(combined, per_bounds=per_bounds)
+    sharpe_w = {s: round(w * 100, 1) for s, w in zip(styles, weights) if w >= 0.01}
+
+    # 스타일별 평균 월수익률 기반 점수 (음수 보정 후 양수화)
+    avg_ret  = combined.mean()
+    scores   = (avg_ret - avg_ret.min() + 0.001)
+
+    # 비례배분: 점수 비례
+    prop   = scores / scores.sum()
+    prop_w = {s: round(float(v) * 100, 1) for s, v in prop.items()}
+
+    # 집중형: 점수 제곱 비례 (상위 집중)
+    sq     = scores ** 2
+    conc   = sq / sq.sum()
+    conc_w = {s: round(float(v) * 100, 1) for s, v in conc.items()}
+
+    # 균등혼합: 성장주·대체자산·방어주·종합채 고정 25%
+    equal_w = {"성장주": 25.0, "대체자산": 25.0, "방어주": 25.0, "종합채": 25.0}
+
+    return {
+        "Sharpe최적": sharpe_w,
+        "비례배분":   prop_w,
+        "집중형":     conc_w,
+        "균등혼합":   equal_w,
+        "_sharpe":    round(sharpe, 2),
+    }, round(sharpe, 2)
+
+
+def compute_all_regime_allocs(monthly_ret: pd.DataFrame,
+                              regime_series: pd.Series,
+                              current_regime: str) -> tuple[dict, float]:
+    """
+    국면 역사 기반 4가지 배분 계산 (현재 국면 구간 전체 실적 기반)
+    Returns (all_allocs_dict, sharpe)
+    """
+    regime_s = regime_series.copy()
+    regime_s.index = regime_s.index.to_period("M").to_timestamp("M")
+    regime_s = regime_s[~regime_s.index.duplicated(keep="last")]
+
+    ret = monthly_ret.copy()
+    ret.index = ret.index.to_period("M").to_timestamp("M")
+
+    combined = ret.copy()
+    combined["__regime__"] = regime_s
+    curr_sub = combined[combined["__regime__"] == current_regime].drop(columns=["__regime__"])
+    if len(curr_sub) < 3:
+        return {}, np.nan
+
+    style_rets = {}
+    for style, etfs in STYLE_ETFS.items():
+        if style not in OPTIMAL_STYLES:
+            continue
+        tickers = [t for t, _ in etfs if t in curr_sub.columns]
+        if tickers:
+            grp = curr_sub[tickers].mean(axis=1).dropna()
+            if len(grp) >= 3:
+                style_rets[style] = grp
+
+    if len(style_rets) < 2:
+        return {}, np.nan
+
+    ret_mat = pd.DataFrame(style_rets).dropna()
+    styles  = list(ret_mat.columns)
+
+    # Sharpe최적 — 종합채 최대 15% 제약
+    per_bounds = []
+    for s in styles:
+        if s == "현금":
+            per_bounds.append((0.05, 0.30))
+        elif s == "종합채":
+            per_bounds.append((0.0, 0.10))
+        else:
+            per_bounds.append((0.05, 0.65))
+    weights, sharpe = _max_sharpe(ret_mat, per_bounds=per_bounds)
+    sharpe_w = {s: round(w * 100, 1) for s, w in zip(styles, weights) if w >= 0.01}
+
+    # 평균 수익률 기반 점수
+    avg_ret = ret_mat.mean()
+    scores  = avg_ret - avg_ret.min() + 0.001
+
+    prop   = scores / scores.sum()
+    prop_w = {s: round(float(v) * 100, 1) for s, v in prop.items()}
+
+    sq     = scores ** 2
+    conc   = sq / sq.sum()
+    conc_w = {s: round(float(v) * 100, 1) for s, v in conc.items()}
+
+    # 균등혼합: 성장주·대체자산·방어주·종합채 고정 25%
+    equal_w = {"성장주": 25.0, "대체자산": 25.0, "방어주": 25.0, "종합채": 25.0}
+
+    return {
+        "Sharpe최적": sharpe_w,
+        "비례배분":   prop_w,
+        "집중형":     conc_w,
+        "균등혼합":   equal_w,
+        "_sharpe":    round(sharpe, 2),
+    }, round(sharpe, 2)
+
+
+# ═══════════════════════════════════════════════
+# HTML 빌더
+# ═══════════════════════════════════════════════
+def build_html(dtw_weights: dict, sharpe_dtw: float,
+               similar: list[tuple], returns_json: str,
+               current_regime: str, as_of: str,
+               available_tickers: list[str],
+               all_allocs: dict | None = None,
+               regime_allocs: dict | None = None) -> str:
+    """전체 HTML 생성"""
+
+    # 테마 ETF 중 가격 데이터 있는 것만 표시
+    avail_set = set(available_tickers)
+
+    # ── Tab 1: 포트폴리오 구성 ──────────────────
+    tab1_html = _build_tab1(dtw_weights, sharpe_dtw, similar,
+                            current_regime, as_of, avail_set,
+                            regime_allocs=regime_allocs)
+
+    # ── 유사 구간 요약 (JS에 전달) ──────────────
+    similar_json = json.dumps([
+        {"date": d.strftime("%Y-%m"), "sim": round(s, 1)}
+        for d, s in similar
+    ])
+
+    # ── DTW 비중 JSON ────────────────────────────
+    dtw_w_json = json.dumps(dtw_weights)
+
+    # ── 4가지 배분 모드 JSON ─────────────────────
+    all_allocs_json = json.dumps(all_allocs or {"Sharpe최적": dtw_weights, "_sharpe": sharpe_dtw},
+                                 ensure_ascii=False)
+
+    # ── 국면 역사 기반 배분 JSON ──────────────────
+    _default_regime = regime_allocs or {"Sharpe최적": dtw_weights, "_sharpe": sharpe_dtw}
+    regime_allocs_json = json.dumps(_default_regime, ensure_ascii=False)
+
+    # ── 스타일·색상 JSON ─────────────────────────
+    style_colors_json = json.dumps(STYLE_COLORS)
+    tilt_fx_json      = json.dumps(TILT_EFFECTS)
+    base_sub_json     = json.dumps(BASE_ETF_SUB)
+
+    # ── ETF → 스타일 매핑 JSON ───────────────────
+    etf_style_map = {t: style for style, etfs in STYLE_ETFS.items() for t, _ in etfs}
+    etf_style_map.update(THEME_ETF_STYLE)   # 테마 ETF 성격 추가
+    etf_style_map_json = json.dumps(etf_style_map, ensure_ascii=False)
+
+    # Plotly JS 인라인 임베드 (CDN 의존성 제거 → 오프라인·타 PC 전송 가능)
+    import plotly.offline as _poff
+    plotly_js = _poff.get_plotlyjs()
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>모델 포트폴리오</title>
+<script>{plotly_js}</script>
+<style>
+{_css()}
+</style>
+</head>
+<body>
+<div class="page-header">
+  <div>
+    <h1>📐 모델 포트폴리오 구성 & 시뮬레이션</h1>
+    <div class="subtitle">
+      현재 국면:
+      <span style="color:{REGIME_COLORS.get(current_regime,'#aaa')};font-weight:bold;margin:0 6px;">{current_regime}</span>
+      | 기준일: {as_of}
+      | 구성: 성장주 · 가치주 · 방어주 · 현금 · 대체자산 | DTW 유사구간 기반 추천 배분 → ETF 편입 → 백테스트
+    </div>
+  </div>
+  <button id="save-btn" onclick="saveSimulation()" title="시뮬레이션 실행 후 활성화됩니다">
+    💾 결과 저장
+  </button>
+</div>
+
+<div class="tab-bar">
+  <button class="tab-btn active" onclick="showTab('builder',this)">📋 포트폴리오 구성</button>
+  <button class="tab-btn" id="sim-tab-btn" onclick="showTab('simulation',this)">📈 백테스트 시뮬레이션</button>
+  <button class="tab-btn" id="perf-tab-btn" onclick="showTab('performance',this)">📊 시뮬레이션 성과</button>
+  <button class="tab-btn" id="improve-tab-btn" onclick="showTab('improvement',this)">🔍 개선안 분석</button>
+</div>
+
+<div id="builder" class="tab-content active">
+  {tab1_html}
+</div>
+
+<div id="simulation" class="tab-content">
+  <div class="content" id="sim-content">
+    <div style="text-align:center;padding:80px;color:rgba(255,255,255,0.3);">
+      포트폴리오 구성 탭에서 <b style="color:rgba(255,255,255,0.6);">시뮬레이션 실행</b> 버튼을 클릭하세요.
+    </div>
+  </div>
+</div>
+
+<div id="improvement" class="tab-content">
+  <div class="content">
+    <div class="section">
+      <h2 class="section-title" style="margin-bottom:8px;">💡 개선 포트폴리오 제안</h2>
+      <p style="font-size:12px;color:rgba(255,255,255,0.4);margin-bottom:16px;">
+        현재 ETF 구성에서 비중만 조정해 ① 수익률 유지·변동성↓ &nbsp;② 변동성 유지·수익률↑ 두 가지 개선안을 Monte Carlo 기반으로 탐색하고 효율적 투자기회선을 표시합니다.<br>
+        <span style="color:rgba(255,255,255,0.3);">※ 먼저 백테스트 시뮬레이션을 실행한 뒤 아래 버튼을 클릭하세요.</span>
+      </p>
+      <div style="text-align:center;margin-bottom:20px;">
+        <button id="improve-btn" onclick="showImproved()"
+          style="padding:12px 40px;font-size:15px;font-weight:bold;
+                 background:linear-gradient(135deg,#27ae60,#2ecc71);
+                 color:white;border:none;border-radius:8px;cursor:pointer;">
+          🔍 개선 포트폴리오 분석
+        </button>
+      </div>
+      <div id="improved-result"></div>
+    </div>
+  </div>
+  <div id="imp-backtest-section" style="display:none;"></div>
+</div>
+
+<div id="performance" class="tab-content">
+  <div class="content" id="perf-content">
+    <div style="text-align:center;padding:80px;color:rgba(255,255,255,0.3);">
+      포트폴리오 구성 탭에서 <b style="color:rgba(255,255,255,0.6);">시뮬레이션 실행</b> 버튼을 클릭하세요.
+    </div>
+  </div>
+</div>
+
+<!-- 기간 선택 팝업 (클릭 인터랙션) -->
+<div id="perf-popup" style="display:none;position:fixed;z-index:9999;
+     background:#1e1e2e;border:1px solid rgba(255,255,255,0.15);border-radius:8px;
+     padding:12px 16px;font-family:'Malgun Gothic',sans-serif;font-size:13px;
+     color:white;box-shadow:0 4px 20px rgba(0,0,0,0.6);min-width:220px;
+     pointer-events:auto;"></div>
+
+<script>
+// ── 임베드 데이터 ─────────────────────────────
+const MONTHLY_DATA   = {returns_json};
+const DTW_WEIGHTS    = {dtw_w_json};
+const ALL_DTW_ALLOCS = {all_allocs_json};
+const REGIME_ALLOCS  = {regime_allocs_json};
+const STYLE_COLORS   = {style_colors_json};
+const TILT_FX        = {tilt_fx_json};
+const BASE_ETF_SUB   = {base_sub_json};
+const SIMILAR_LIST   = {similar_json};
+const ETF_STYLE_MAP  = {etf_style_map_json};
+
+{_javascript()}
+</script>
+</body>
+</html>"""
+
+
+def _build_tab1(dtw_weights, sharpe_dtw, similar,
+                current_regime, as_of, avail_set,
+                regime_allocs=None):
+    rc = REGIME_COLORS.get(current_regime, "#555")
+
+    # ── A. DTW 추천 비중 도넛 차트 ───────────────
+    styles  = list(dtw_weights.keys())
+    vals    = list(dtw_weights.values())
+    colors  = [STYLE_COLORS.get(s, "#aaa") for s in styles]
+
+    import plotly.graph_objects as go
+    fig_donut = go.Figure(go.Pie(
+        labels=styles, values=vals,
+        marker=dict(colors=colors, line=dict(color="#111", width=2)),
+        texttemplate="%{label}<br><b>%{value:.1f}%</b>",
+        textfont=dict(size=12, family="Malgun Gothic"),
+        hovertemplate="%{label}: %{value:.1f}%<extra></extra>",
+        hole=0.45,
+    ))
+    fig_donut.update_layout(
+        template="plotly_dark", paper_bgcolor="#161622", plot_bgcolor="#161622",
+        margin=dict(l=10,r=10,t=30,b=10), height=240, width=280,
+        showlegend=False, font=dict(family="Malgun Gothic"),
+        annotations=[dict(text=f"샤프<br><b>{sharpe_dtw:.2f}</b>",
+                          x=0.5, y=0.5, font_size=13,
+                          showarrow=False,
+                          font=dict(color="rgba(255,255,255,0.7)"))]
+    )
+    donut_html = fig_donut.to_html(full_html=False, include_plotlyjs=False,
+                                   div_id="dtw-donut",
+                                   config={"displayModeBar": False})
+
+    # ── DTW 비중 테이블 ───────────────────────────
+    th = "padding:7px 12px;font-size:12px;border-bottom:2px solid #2c3e50;"
+    td = "padding:6px 12px;font-size:12px;border-bottom:1px solid rgba(255,255,255,0.06);"
+    w_rows = []
+    for s, w in sorted(dtw_weights.items(), key=lambda x: -x[1]):
+        c = STYLE_COLORS.get(s, "#aaa")
+        w_rows.append(
+            f"<tr><td style='{td}font-weight:bold;color:{c};'>{s}</td>"
+            f"<td style='{td}text-align:right;font-weight:bold;'>{w:.1f}%</td></tr>"
+        )
+    weight_table = (
+        f"<table style='width:100%;border-collapse:collapse;'>"
+        f"<tr><th style='{th}text-align:left;'>스타일</th>"
+        f"<th style='{th}text-align:right;'>비중</th></tr>"
+        f"<tbody id='dtw-weight-tbody'>"
+        + "".join(w_rows)
+        + f"</tbody></table>"
+    )
+
+    # ── 배분 모드 버튼 ────────────────────────────
+    modes = [("비례배분", ""), ("집중형", ""), ("균등혼합", ""), ("Sharpe최적", " active")]
+    mode_buttons = " ".join(
+        f'<button class="dtw-mode-btn{cls}" data-mode="{m}" '
+        f'onclick="switchAllocMode(\'{m}\')">{m}</button>'
+        for m, cls in modes
+    )
+    similar_str = ', '.join([d.strftime('%Y.%m') for d, _ in similar])
+
+    # ── B. 테마 ETF 선택 체크박스 HTML ────────────
+    theme_groups_html = []
+    for group, etfs in THEME_ETF_GROUPS.items():
+        btns = []
+        for ticker, name, aum, star in etfs:
+            in_data = ticker in avail_set
+            disabled = "" if in_data else "disabled title='가격데이터 없음'"
+            opacity  = "1" if in_data else "0.35"
+            btns.append(
+                f"<label style='display:inline-flex;align-items:center;gap:5px;"
+                f"padding:4px 10px;background:rgba(255,255,255,0.05);"
+                f"border:1px solid rgba(255,255,255,0.12);border-radius:5px;"
+                f"cursor:{'pointer' if in_data else 'default'};"
+                f"font-size:12px;opacity:{opacity};margin:3px;'>"
+                f"<input type='checkbox' class='theme-chk' value='{ticker}' "
+                f"onchange='updateSatellite()' {disabled} "
+                f"style='accent-color:#7f5af0;'>"
+                f"<span style='font-weight:bold;color:#f1c40f;'>{ticker}</span>"
+                f"<span style='color:rgba(255,255,255,0.5);'>{name[:18]}</span>"
+                f"<span style='color:#2ecc71;font-size:10px;'>{'★'*star}</span>"
+                f"</label>"
+            )
+        theme_groups_html.append(
+            f"<div style='margin-bottom:10px;'>"
+            f"<div style='font-size:11px;color:rgba(255,255,255,0.4);"
+            f"margin-bottom:4px;font-weight:bold;'>{group}</div>"
+            + "".join(btns) + "</div>"
+        )
+
+    # ── C. 틸팅 슬라이더 HTML ─────────────────────
+    tilt_sliders = []
+    for key, (left_label, right_label, icon) in TILT_LABELS.items():
+        tilt_sliders.append(f"""
+<div class="tilt-row">
+  <div class="tilt-label">{icon} {key}</div>
+  <div class="tilt-left">{left_label}</div>
+  <input type="range" min="-2" max="2" step="0.5" value="0"
+         id="tilt-{key}" class="tilt-slider"
+         oninput="updateTiltDisplay('{key}',this.value);updateWeightsDisplay()">
+  <div class="tilt-right">{right_label}</div>
+  <div class="tilt-val" id="tilt-val-{key}">0</div>
+</div>""")
+
+    return f"""
+<div class="content">
+
+  <!-- A. 추천 자산배분 (소스 선택 + 배분 모드) -->
+  <div class="section">
+    <h2 class="section-title">📊 추천 자산 배분</h2>
+    <p class="section-desc" style="margin-bottom:14px;">
+      두 가지 추천 방식 중 하나를 먼저 선택한 뒤, 세부 배분 방법을 설정하세요.
+    </p>
+
+    <!-- 소스 선택 카드 (좌: 국면 역사 기반 / 우: DTW 기반) -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px;">
+      <div id="src-card-regime" class="src-card active" onclick="switchAllocSource('regime')">
+        <div style="font-size:14px;font-weight:bold;color:rgba(255,255,255,0.9);margin-bottom:4px;">① 국면 역사 기반</div>
+        <div style="font-size:12px;color:rgba(255,255,255,0.4);margin-bottom:6px;">
+          현재 국면: <span style="color:{rc};">{current_regime}</span>
+        </div>
+        <div style="font-size:12px;color:rgba(255,255,255,0.5);line-height:1.5;">
+          과거 <b>{current_regime}</b> 기간 전체의 스타일별 성과를 점수화하여 배분.<br>
+          더 안정적이나 현재 시점에 덜 특화됨.
+        </div>
+      </div>
+      <div id="src-card-dtw" class="src-card" onclick="switchAllocSource('dtw')">
+        <div style="font-size:14px;font-weight:bold;color:rgba(255,255,255,0.9);margin-bottom:4px;">② DTW 패턴 매칭 기반</div>
+        <div style="font-size:12px;color:rgba(255,255,255,0.4);margin-bottom:6px;">
+          유사구간: {similar_str} | 기준: {as_of}
+        </div>
+        <div style="font-size:12px;color:rgba(255,255,255,0.5);line-height:1.5;">
+          현재 지표 궤적(VIX·금리차·CPI 등)과 가장 유사한 과거 {len(similar)}개 구간<br>
+          이후 성과 기반. 현재 시장 패턴에 특화됨.
+        </div>
+      </div>
+    </div>
+
+    <!-- 배분 모드 선택 버튼 -->
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+      {mode_buttons}
+    </div>
+    <p class="section-desc" id="alloc-mode-desc" style="margin-bottom:14px;"></p>
+
+    <!-- 도넛 차트 + 비중 테이블 -->
+    <div style="display:grid;grid-template-columns:300px 1fr;gap:24px;align-items:start;">
+      <div>{donut_html}</div>
+      <div style="padding-top:16px;">{weight_table}</div>
+    </div>
+  </div>
+
+  <!-- B. 투자금액 설정 -->
+  <div class="section">
+    <h2 class="section-title">💰 투자 금액 설정</h2>
+    <div style="display:flex;flex-direction:column;gap:14px;">
+      <!-- 금액 + 배지 -->
+      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <label style="font-size:14px;color:rgba(255,255,255,0.6);">총 투자금액</label>
+          <input type="number" id="total-amount" value="1" min="1" max="10000" step="1"
+                 oninput="updateAmounts()"
+                 style="width:100px;padding:8px 12px;background:#1a1a2e;border:1px solid #2c3e50;
+                        border-radius:5px;color:white;font-size:16px;font-family:'Malgun Gothic',sans-serif;
+                        text-align:right;">
+          <span style="font-size:14px;color:rgba(255,255,255,0.6);">천만원</span>
+        </div>
+        <div style="display:flex;gap:16px;">
+          <div class="amount-badge" style="background:rgba(41,128,185,0.2);border-color:#2980b9;">
+            <div style="font-size:11px;color:#2980b9;">Core (<span id="core-ratio-pct">70</span>%)</div>
+            <div style="font-size:16px;font-weight:bold;" id="core-amount">7,000만원</div>
+          </div>
+          <div class="amount-badge" style="background:rgba(127,90,240,0.2);border-color:#7f5af0;">
+            <div style="font-size:11px;color:#7f5af0;">Satellite (<span id="sat-ratio-pct">30</span>%)</div>
+            <div style="font-size:16px;font-weight:bold;" id="sat-amount">3,000만원</div>
+          </div>
+        </div>
+      </div>
+      <!-- Core/Satellite 비중 슬라이더 -->
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+        <span style="font-size:13px;color:rgba(255,255,255,0.5);white-space:nowrap;">Core 비중</span>
+        <span style="font-size:12px;color:#2980b9;font-weight:bold;white-space:nowrap;">
+          <span id="core-slider-label">70</span>%
+        </span>
+        <input type="range" id="core-ratio" min="50" max="100" step="5" value="70"
+               oninput="updateRatio()"
+               style="flex:1;min-width:160px;max-width:300px;accent-color:#2980b9;cursor:pointer;">
+        <span style="font-size:12px;color:#7f5af0;font-weight:bold;white-space:nowrap;">
+          Satellite <span id="sat-slider-label">30</span>%
+        </span>
+        <span style="font-size:11px;color:rgba(255,255,255,0.3);">
+          (Core 50%~100%, 5% 단위)
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <!-- C. Core 포트폴리오 -->
+  <div class="section">
+    <h2 class="section-title">📈 Core 포트폴리오 <span id="core-title-pct" style="font-size:14px;color:#2980b9;font-weight:normal;">인덱스형 ETF · 투자금의 70%</span></h2>
+    <p class="section-desc">DTW 추천 스타일 비중을 기준으로, 각 스타일의 대표 인덱스 ETF에 배분합니다.
+    <b style="color:rgba(255,255,255,0.7);">성장주 · 가치주 · 방어주 · 현금 · 대체자산</b> 5가지로 구성 (채권·경기민감 제외). 현금 최대 30% 제한.
+    내러티브 틸팅 적용 시 비중이 실시간으로 조정됩니다.</p>
+    <div style="overflow-x:auto;">
+      <table id="core-table" style="width:100%;border-collapse:collapse;font-size:13px;">
+        <thead>
+          <tr>
+            <th style="padding:9px 12px;border-bottom:2px solid #2c3e50;text-align:left;">스타일</th>
+            <th style="padding:9px 12px;border-bottom:2px solid #2c3e50;text-align:right;">스타일비중</th>
+            <th style="padding:9px 12px;border-bottom:2px solid #2c3e50;text-align:left;">ETF</th>
+            <th style="padding:9px 12px;border-bottom:2px solid #2c3e50;text-align:right;">ETF비중</th>
+            <th style="padding:9px 12px;border-bottom:2px solid #2c3e50;text-align:right;">금액(만원)</th>
+          </tr>
+        </thead>
+        <tbody id="core-tbody"><!-- JS로 채움 --></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- D. Satellite 포트폴리오 -->
+  <div class="section">
+    <h2 class="section-title">🎯 Satellite 포트폴리오 <span id="sat-title-pct" style="font-size:14px;color:#7f5af0;font-weight:normal;">테마형 ETF · 투자금의 30%</span></h2>
+    <p class="section-desc">관심 테마 ETF를 선택하면 선택된 ETF에 균등 배분합니다. (미선택 시 Core에 통합)
+    <span style="color:rgba(255,255,255,0.35);font-size:11px;">| 회색 표시: 가격 데이터 미보유 (시뮬레이션 제외)</span></p>
+    <div style="margin-bottom:12px;">
+      {"".join(theme_groups_html)}
+    </div>
+    <div id="satellite-summary" style="padding:10px 14px;background:rgba(127,90,240,0.08);
+         border:1px solid rgba(127,90,240,0.25);border-radius:6px;font-size:13px;
+         color:rgba(255,255,255,0.6);">
+      선택된 ETF: <span id="sat-selected-count" style="color:#7f5af0;font-weight:bold;">0</span>개
+      — 미선택 시 Core 비중에 통합하여 시뮬레이션
+    </div>
+  </div>
+
+  <!-- E. 내러티브 틸팅 -->
+  <div class="section">
+    <h2 class="section-title">🎚 내러티브 틸팅</h2>
+    <p class="section-desc">현재 시장 내러티브에 맞게 스타일 비중을 미세 조정합니다.
+    슬라이더 이동 시 Core 배분 테이블이 실시간 업데이트됩니다.</p>
+    <div class="tilt-grid">
+      {"".join(tilt_sliders)}
+    </div>
+    <div id="tilt-impact" style="margin-top:14px;padding:10px 14px;
+         background:rgba(255,255,255,0.03);border-radius:6px;
+         font-size:12px;color:rgba(255,255,255,0.45);">
+      틸팅 미적용 (기본 DTW 비중 사용)
+    </div>
+  </div>
+
+  <!-- F. 실행 버튼 -->
+  <div class="section" style="text-align:center;padding:32px;">
+    <button id="run-btn" onclick="runSimulation()"
+            style="padding:16px 60px;font-size:18px;font-weight:bold;
+                   background:linear-gradient(135deg,#2980b9,#7f5af0);
+                   color:white;border:none;border-radius:10px;cursor:pointer;
+                   font-family:'Malgun Gothic',sans-serif;
+                   box-shadow:0 4px 20px rgba(127,90,240,0.4);
+                   transition:all 0.2s;">
+      🚀 시뮬레이션 실행
+    </button>
+    <p style="margin-top:12px;font-size:12px;color:rgba(255,255,255,0.3);">
+      ※ 분기별 리밸런싱 가정, 수수료 미반영, 과거 성과가 미래를 보장하지 않습니다.
+    </p>
+  </div>
+
+</div>"""
+
+
+def _css() -> str:
+    return """
+*, *::before, *::after { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0; background: #111111;
+  font-family: 'Malgun Gothic', Arial, sans-serif;
+  color: rgba(255,255,255,0.87);
+}
+.page-header {
+  background: #1a1a2e; padding: 16px 28px;
+  border-bottom: 2px solid #2c3e50;
+  position: sticky; top: 0; z-index: 200;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.page-header h1 { margin: 0; font-size: 19px; color: white; }
+.page-header .subtitle { color: rgba(255,255,255,0.45); font-size: 12px; margin-top: 3px; }
+#save-btn {
+  padding: 9px 20px; font-size: 13px; font-weight: bold;
+  font-family: 'Malgun Gothic', sans-serif;
+  background: linear-gradient(135deg, #27ae60, #2ecc71);
+  color: white; border: none; border-radius: 8px; cursor: pointer;
+  white-space: nowrap; transition: opacity 0.15s;
+}
+#save-btn:hover { opacity: 0.85; }
+.tab-bar {
+  display: flex; background: #1a1a2e; padding: 8px 20px 0;
+  gap: 4px; border-bottom: 2px solid #2c3e50;
+  position: fixed; top: 73px; left: 0; width: 100%; z-index: 100;
+  box-sizing: border-box;
+}
+.tab-btn {
+  flex: 1; min-width: 0;
+  padding: 9px 8px; cursor: pointer; border: none;
+  border-radius: 6px 6px 0 0;
+  background: rgba(255,255,255,0.07); color: rgba(255,255,255,0.65);
+  font-size: clamp(11px, 1.3vw, 15px); font-family: 'Malgun Gothic', Arial, sans-serif;
+  transition: background 0.2s;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.src-card {
+  background: rgba(255,255,255,0.04);
+  border: 2px solid rgba(255,255,255,0.12);
+  border-radius: 10px; padding: 16px 20px;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+}
+.src-card:hover { border-color: rgba(255,255,255,0.3); background: rgba(255,255,255,0.07); }
+.src-card.active { border-color: #2980b9; background: rgba(41,128,185,0.12); }
+.dtw-mode-btn {
+  padding: 7px 18px; border-radius: 6px; cursor: pointer;
+  border: 1px solid rgba(255,255,255,0.2);
+  background: rgba(255,255,255,0.07); color: white;
+  font-size: 12px; font-family: 'Malgun Gothic', Arial, sans-serif;
+  transition: background 0.15s, border-color 0.15s;
+}
+.dtw-mode-btn.active {
+  background: #2980b9; border-color: #2980b9;
+}
+.tab-btn:hover { background: rgba(255,255,255,0.14); color: white; }
+.tab-btn.active {
+  background: #111111; color: white; font-weight: bold;
+  border-bottom: 2px solid #111111; margin-bottom: -2px;
+}
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+.content { max-width: 1300px; margin: 0 auto; padding: 20px 28px 60px; }
+.section {
+  background: #161622; border-radius: 8px;
+  padding: 22px 26px; margin-bottom: 22px;
+  border: 1px solid rgba(255,255,255,0.06);
+}
+.section-title { margin: 0 0 8px; font-size: 17px; font-weight: bold; color: white; }
+.section-desc { color: rgba(255,255,255,0.5); font-size: 13px; line-height: 1.7; margin: 0 0 16px; }
+.amount-badge {
+  padding: 8px 16px; border-radius: 6px; border: 1px solid;
+  text-align: center; min-width: 130px;
+}
+.tilt-grid { display: flex; flex-direction: column; gap: 12px; }
+.tilt-row {
+  display: grid; gap: 10px; align-items: center;
+  grid-template-columns: 90px 110px 1fr 110px 40px;
+}
+.tilt-label { font-size: 13px; font-weight: bold; color: rgba(255,255,255,0.8); }
+.tilt-left  { font-size: 11px; color: rgba(255,255,255,0.4); text-align: right; }
+.tilt-right { font-size: 11px; color: rgba(255,255,255,0.4); }
+.tilt-val   { font-size: 13px; font-weight: bold; color: #f1c40f; text-align: center; }
+.tilt-slider {
+  -webkit-appearance: none; width: 100%; height: 5px;
+  background: linear-gradient(to right, #2980b9, #7f5af0);
+  border-radius: 3px; outline: none; cursor: pointer;
+}
+.tilt-slider::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 16px; height: 16px;
+  background: white; border-radius: 50%;
+  border: 2px solid #7f5af0; cursor: pointer;
+}
+#run-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 28px rgba(127,90,240,0.6);
+}
+.sim-metric-card {
+  background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px; padding: 14px 18px; text-align: center;
+}
+.sim-metric-label { font-size: 11px; color: rgba(255,255,255,0.4); margin-bottom: 4px; }
+.sim-metric-value { font-size: 22px; font-weight: bold; }
+"""
+
+
+def _javascript() -> str:
+    # BASE_ETF_INFO를 JS에서 사용하기 위해
+    etf_info_js = json.dumps({
+        k: {"name": v[0], "desc": v[1], "cost": v[2]}
+        for k, v in BASE_ETF_INFO.items()
+    }, ensure_ascii=False)
+
+    return f"""
+// ── ETF 정보 ───────────────────────────────────
+const ETF_INFO = {etf_info_js};
+
+// ── 레이아웃 동기화 (헤더 높이 → 탭바 top + 콘텐츠 padding) ─────
+function _syncLayout() {{
+  const hdr = document.querySelector('.page-header');
+  const bar = document.querySelector('.tab-bar');
+  if (!hdr || !bar) return;
+  const hh = hdr.getBoundingClientRect().height;
+  bar.style.top = hh + 'px';
+  const bh = bar.getBoundingClientRect().height;
+  const total = Math.ceil(hh + bh) + 'px';
+  document.querySelectorAll('.tab-content').forEach(el => {{
+    el.style.paddingTop = total;
+  }});
+}}
+window.addEventListener('resize', _syncLayout);
+
+// ── 탭 전환 ─────────────────────────────────────
+const CHART_IDS = ['chart-cum','chart-yr','chart-dd','chart-pie','perf-chart-cum',
+                   'stress-hist-chart','stress-mc-chart'];
+
+// 스트레스 테스트용 전역 데이터
+let _lastWeights   = null;   // 최근 시뮬레이션 ETF 비중
+let _portRet2010   = null;   // 2010년 이후 월별 수익률 (Monte Carlo용)
+let _globalImp1    = null;   // 개선안① 프론티어 포인트 (weights 포함)
+let _globalImp2    = null;   // 개선안② 프론티어 포인트 (weights 포함)
+let _globalCurrNorm = null;  // 현재 포트폴리오 정규화 비중
+
+// 저장용 성과 지표
+let _portMetrics = null;
+let _spyMetrics  = null;
+let _bmMetrics   = null;
+
+// 배분 소스·모드 상태 (기본: 국면 역사 기반 · Sharpe최적)
+let _activeAllocSource = 'regime';
+let _activeAllocMode   = 'Sharpe최적';
+let _activeDtwWeights  = {{...(REGIME_ALLOCS['Sharpe최적'] || DTW_WEIGHTS)}};
+function showTab(id, btn) {{
+  hidePerfPopup();   // 탭 이동 시 기간 선택 팝업 즉시 닫기
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
+  // 탭이 visible 된 후 Plotly 강제 리사이즈
+  setTimeout(() => {{
+    CHART_IDS.forEach(cid => {{
+      const el = document.getElementById(cid);
+      if (el && el.data && el.data.length) Plotly.relayout(cid, {{autosize: true}});
+    }});
+  }}, 60);
+}}
+
+// ── 배분 소스·모드 전환 ────────────────────────
+const _ALLOC_MODE_DESC = {{
+  'Sharpe최적': '상관관계를 고려한 최대 샤프 비율 포트폴리오. 각 자산 5~65% 제약.',
+  '비례배분':   '성과 점수에 비례하여 배분. 다양한 스타일에 분산 투자.',
+  '집중형':     '상위 스타일에 집중 투자 (점수² 비례). 수익성 우선.',
+  '균등혼합':   '성장주·대체자산·방어주·종합채(AGG) 각 25% 고정 배분. 주식+대체+채권 균형.',
+}};
+
+function _getActiveAllocData() {{
+  return _activeAllocSource === 'regime' ? REGIME_ALLOCS : ALL_DTW_ALLOCS;
+}}
+
+function _refreshAllocDisplay() {{
+  const allocs = _getActiveAllocData();
+  const alloc  = allocs[_activeAllocMode];
+  if (!alloc) return;
+
+  _activeDtwWeights = {{...alloc}};
+
+  // 도넛 차트 업데이트
+  const styles = Object.keys(alloc);
+  const vals   = Object.values(alloc);
+  const colors = styles.map(s => STYLE_COLORS[s] || '#aaa');
+  const sharpe = allocs._sharpe ?? '';
+  const centerText = _activeAllocMode === 'Sharpe최적'
+    ? `샤프<br><b>${{sharpe}}</b>`
+    : _activeAllocMode.replace('최적','').replace('배분','<br>배분');
+  Plotly.newPlot('dtw-donut', [{{
+    type: 'pie', labels: styles, values: vals,
+    marker: {{colors, line: {{color:'#111', width:2}}}},
+    texttemplate: '%{{label}}<br><b>%{{value:.1f}}%</b>',
+    textfont: {{size:12, family:'Malgun Gothic'}},
+    hovertemplate: '%{{label}}: %{{value:.1f}}%<extra></extra>',
+    hole: 0.45,
+  }}], {{
+    template: 'plotly_dark',
+    paper_bgcolor: '#161622', plot_bgcolor: '#161622',
+    margin: {{l:10,r:10,t:30,b:10}}, height:240,
+    showlegend: false,
+    font: {{family:'Malgun Gothic', color:'rgba(255,255,255,0.9)'}},
+    annotations: [{{text:centerText, x:0.5, y:0.5, showarrow:false,
+                    font:{{size:13, color:'rgba(255,255,255,0.7)'}}}}],
+  }}, {{displayModeBar:false, responsive:true}});
+
+  // 비중 테이블 업데이트
+  const tbody = document.getElementById('dtw-weight-tbody');
+  if (tbody) {{
+    const sorted = Object.entries(alloc).sort((a,b) => b[1]-a[1]);
+    const TD1 = 'padding:6px 12px;font-size:12px;border-bottom:1px solid rgba(255,255,255,0.06);font-weight:bold;';
+    const TD2 = TD1 + 'text-align:right;';
+    tbody.innerHTML = sorted.map(([s, w]) => {{
+      const c = STYLE_COLORS[s] || '#aaa';
+      return `<tr><td style="${{TD1}}color:${{c}};">${{s}}</td><td style="${{TD2}}">${{w.toFixed(1)}}%</td></tr>`;
+    }}).join('');
+  }}
+
+  // 설명 텍스트
+  const descEl = document.getElementById('alloc-mode-desc');
+  if (descEl) descEl.textContent = _ALLOC_MODE_DESC[_activeAllocMode] || '';
+
+  updateWeightsDisplay();
+}}
+
+function switchAllocSource(src) {{
+  _activeAllocSource = src;
+  document.querySelectorAll('.src-card').forEach(c => c.classList.remove('active'));
+  const card = document.getElementById('src-card-' + src);
+  if (card) card.classList.add('active');
+  _refreshAllocDisplay();
+}}
+
+function switchAllocMode(mode) {{
+  _activeAllocMode = mode;
+  document.querySelectorAll('.dtw-mode-btn').forEach(btn => {{
+    btn.classList.toggle('active', btn.dataset.mode === mode);
+  }});
+  _refreshAllocDisplay();
+}}
+
+// 하위 호환 alias
+function switchDtwMode(mode) {{ switchAllocMode(mode); }}
+
+// ── 현재 스타일 비중 계산 (틸팅 반영) ────────────
+function getCurrentStyleWeights() {{
+  const base = {{..._activeDtwWeights}};
+  for (const [tilt, effects] of Object.entries(TILT_FX)) {{
+    const val = parseFloat(document.getElementById('tilt-' + tilt)?.value || 0);
+    if (val === 0) continue;
+    for (const [style, delta] of Object.entries(effects)) {{
+      if (style in base) base[style] = (base[style] || 0) + delta * val;
+    }}
+  }}
+
+  // 음수 제거 + 정규화 (합계 100% 보장)
+  let total = 0;
+  for (const k in base) {{ base[k] = Math.max(0, base[k]); total += base[k]; }}
+  if (total > 0) for (const k in base) base[k] = base[k] / total * 100;
+
+  return base;
+}}
+
+// ── 틸팅 표시 업데이트 ───────────────────────────
+function updateTiltDisplay(key, val) {{
+  const el = document.getElementById('tilt-val-' + key);
+  if (!el) return;
+  const v = parseFloat(val);
+  el.textContent = v > 0 ? '+' + v : v;
+  el.style.color = v > 0 ? '#2ecc71' : v < 0 ? '#e74c3c' : '#f1c40f';
+}}
+
+// ── Core/Satellite 비중 헬퍼 ────────────────────
+function getCoreRatio() {{
+  return parseFloat(document.getElementById('core-ratio')?.value || 70) / 100;
+}}
+
+function updateRatio() {{
+  const cPct = parseInt(document.getElementById('core-ratio').value);
+  const sPct = 100 - cPct;
+  document.getElementById('core-slider-label').textContent = cPct;
+  document.getElementById('sat-slider-label').textContent  = sPct;
+  document.getElementById('core-ratio-pct').textContent    = cPct;
+  document.getElementById('sat-ratio-pct').textContent     = sPct;
+  const cTitle = document.getElementById('core-title-pct');
+  const sTitle = document.getElementById('sat-title-pct');
+  if (cTitle) cTitle.textContent = `인덱스형 ETF · 투자금의 ${{cPct}}%`;
+  if (sTitle) sTitle.textContent = `테마형 ETF · 투자금의 ${{sPct}}%`;
+  updateAmounts();
+}}
+
+// ── Core 테이블 업데이트 ─────────────────────────
+function updateWeightsDisplay() {{
+  const coreRatio = getCoreRatio();
+  const totalAmt  = parseFloat(document.getElementById('total-amount').value || 1) * 1000;
+  const coreAmt   = totalAmt * coreRatio;
+  const sw = getCurrentStyleWeights();
+
+  const tbody = document.getElementById('core-tbody');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+
+  for (const [style, stylePct] of Object.entries(sw)) {{
+    if (!BASE_ETF_SUB[style] || stylePct < 0.1) continue;
+    const subEtfs = BASE_ETF_SUB[style];
+    const entries = Object.entries(subEtfs);
+    const color   = STYLE_COLORS[style] || '#aaa';
+    let firstRow  = true;
+
+    for (const [etf, subW] of entries) {{
+      const etfPct     = stylePct * subW;              // 전체 대비 ETF 비중(%)
+      const coreEtfPct = etfPct * coreRatio;          // 최종 포트 비중
+      const amt        = coreAmt * (stylePct/100) * subW;
+      const info    = ETF_INFO[etf] || {{}};
+
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        ${{firstRow
+          ? `<td rowspan="${{entries.length}}" style="padding:8px 12px;font-weight:bold;
+              color:${{color}};border-bottom:1px solid rgba(255,255,255,0.06);
+              border-right:1px solid rgba(255,255,255,0.04);vertical-align:middle;">
+              ${{style}}</td>
+             <td rowspan="${{entries.length}}" style="padding:8px 12px;text-align:right;
+              font-weight:bold;color:${{color}};border-bottom:1px solid rgba(255,255,255,0.06);
+              border-right:1px solid rgba(255,255,255,0.04);vertical-align:middle;">
+              ${{stylePct.toFixed(1)}}%</td>`
+          : ''
+        }}
+        <td style="padding:8px 12px;font-family:monospace;color:#f1c40f;
+                   border-bottom:1px solid rgba(255,255,255,0.06);">
+          ${{etf}}<br><span style="font-size:10px;color:rgba(255,255,255,0.4);
+          font-family:'Malgun Gothic',sans-serif;">${{info.desc || ''}}</span>
+        </td>
+        <td style="padding:8px 12px;text-align:right;
+                   border-bottom:1px solid rgba(255,255,255,0.06);">
+          <span style="font-weight:bold;">${{coreEtfPct.toFixed(1)}}%</span>
+        </td>
+        <td style="padding:8px 12px;text-align:right;
+                   border-bottom:1px solid rgba(255,255,255,0.06);">
+          <span style="color:#2ecc71;font-weight:bold;">${{Math.round(amt).toLocaleString()}}만</span>
+        </td>
+      `;
+      tbody.appendChild(tr);
+      firstRow = false;
+    }}
+  }}
+
+  // 틸팅 영향 표시
+  updateTiltImpact(sw);
+}}
+
+function updateTiltImpact(sw) {{
+  const el = document.getElementById('tilt-impact');
+  if (!el) return;
+  let hasAny = false;
+  for (const key of Object.keys(TILT_FX)) {{
+    const v = parseFloat(document.getElementById('tilt-' + key)?.value || 0);
+    if (v !== 0) {{ hasAny = true; break; }}
+  }}
+  if (!hasAny) {{
+    el.textContent = '틸팅 미적용 (기본 DTW 비중 사용)';
+    return;
+  }}
+  const parts = Object.entries(sw)
+    .sort((a,b)=>b[1]-a[1])
+    .map(([s,w]) => `<span style="color:${{STYLE_COLORS[s]||'#aaa'}};font-weight:bold;">${{s}} ${{w.toFixed(1)}}%</span>`)
+    .join(' · ');
+  el.innerHTML = `틸팅 적용 후 비중: ${{parts}}`;
+}}
+
+// ── 금액 업데이트 ────────────────────────────────
+function updateAmounts() {{
+  const coreRatio = getCoreRatio();
+  const total = parseFloat(document.getElementById('total-amount').value || 1) * 1000;
+  const core  = total * coreRatio;
+  const sat   = total * (1 - coreRatio);
+  document.getElementById('core-amount').textContent =
+    Math.round(core).toLocaleString() + '만원';
+  document.getElementById('sat-amount').textContent =
+    Math.round(sat).toLocaleString() + '만원';
+  updateWeightsDisplay();
+}}
+
+// ── Satellite 선택 업데이트 ──────────────────────
+function updateSatellite() {{
+  const selected = Array.from(document.querySelectorAll('.theme-chk:checked'))
+                        .map(cb => cb.value);
+  document.getElementById('sat-selected-count').textContent = selected.length;
+}}
+
+function getSelectedThemeEtfs() {{
+  return Array.from(document.querySelectorAll('.theme-chk:checked')).map(cb => cb.value);
+}}
+
+// ── ETF 최종 비중 계산 ───────────────────────────
+function buildEtfWeights() {{
+  const coreRatio = getCoreRatio();
+  const sw        = getCurrentStyleWeights();
+  const selected  = getSelectedThemeEtfs();
+  const N         = selected.length;
+  const coreShare = N > 0 ? coreRatio        : 1.00;
+  const satShare  = N > 0 ? (1 - coreRatio)  : 0.00;
+  const weights   = {{}};
+
+  // Core
+  for (const [style, stylePct] of Object.entries(sw)) {{
+    const subEtfs = BASE_ETF_SUB[style];
+    if (!subEtfs) continue;
+    for (const [etf, subW] of Object.entries(subEtfs)) {{
+      weights[etf] = (weights[etf] || 0) + (stylePct/100) * coreShare * subW;
+    }}
+  }}
+
+  // Satellite
+  if (N > 0) {{
+    const perEtf = satShare / N;
+    for (const etf of selected) {{
+      weights[etf] = (weights[etf] || 0) + perEtf;
+    }}
+  }}
+
+  return weights;
+}}
+
+// ── 포트폴리오 수익률 계산 (분기별 리밸런싱) ────────
+function computePortfolioReturns(weights) {{
+  return computePortfolioReturnsQR(weights);
+}}
+
+function computePortfolioReturnsQR(weights) {{
+  const dates   = MONTHLY_DATA.dates;
+  const retData = MONTHLY_DATA.returns;
+  const etfs    = Object.keys(weights).filter(t => t in retData);
+  const totalW  = etfs.reduce((s, t) => s + (weights[t] || 0), 0);
+  if (!etfs.length || totalW <= 0) return {{ dates, returns: dates.map(() => 0) }};
+
+  // 정규화된 목표 비중
+  const normW = {{}};
+  for (const t of etfs) normW[t] = (weights[t] || 0) / totalW;
+
+  // 포지션 초기화 (1원 기준)
+  const pos = {{}};
+  for (const t of etfs) pos[t] = normW[t];
+
+  const portRet = [];
+  for (let i = 0; i < dates.length; i++) {{
+    const monthNum = new Date(dates[i]).getMonth(); // 0=Jan,3=Apr,6=Jul,9=Oct
+
+    // 분기 첫 달(1/4/7/10월) 또는 첫 데이터: 목표 비중으로 리밸런싱
+    if (i === 0 || monthNum % 3 === 0) {{
+      const totV = etfs.reduce((s, t) => s + pos[t], 0);
+      for (const t of etfs) pos[t] = totV * normW[t];
+    }}
+
+    const totBefore = etfs.reduce((s, t) => s + pos[t], 0);
+    for (const t of etfs) {{
+      const v = retData[t][i];
+      if (v !== null && !isNaN(v)) pos[t] *= (1 + v);
+    }}
+    const totAfter = etfs.reduce((s, t) => s + pos[t], 0);
+    portRet.push(totBefore > 0 ? (totAfter / totBefore - 1) : 0);
+  }}
+  return {{ dates, returns: portRet }};
+}}
+
+function computeCumulative(returns, base=100) {{
+  let cum = base, res = [];
+  for (const r of returns) {{ cum *= (1+r); res.push(parseFloat(cum.toFixed(4))); }}
+  return res;
+}}
+
+function computeMetrics(dates, returns) {{
+  // 2010년 이후만
+  const startIdx = dates.findIndex(d => d >= '2010-01-01');
+  const r = returns.slice(startIdx >= 0 ? startIdx : 0);
+  const n = r.length;
+  if (n < 12) return null;
+  const cagr  = (Math.pow(r.reduce((a,b)=>a*(1+b),1), 12/n) - 1) * 100;
+  const mean  = r.reduce((a,b)=>a+b,0) / n;
+  const std   = Math.sqrt(r.map(x=>(x-mean)**2).reduce((a,b)=>a+b,0)/(n-1));
+  const sharpe= std > 0 ? (mean * 12) / (std * Math.sqrt(12)) : 0;
+  let peak=1, mdd=0, cum=1;
+  for (const ret of r) {{
+    cum *= (1+ret);
+    if (cum > peak) peak = cum;
+    const dd = (peak-cum)/peak;
+    if (dd > mdd) mdd = dd;
+  }}
+  const yrMap = {{}};
+  dates.slice(startIdx >= 0 ? startIdx : 0).forEach((d,i) => {{
+    const yr = d.slice(0,4);
+    if (!yrMap[yr]) yrMap[yr] = [];
+    yrMap[yr].push(r[i]);
+  }});
+  const annualRet = Object.fromEntries(
+    Object.entries(yrMap).map(([yr,rets]) => [yr, (rets.reduce((a,b)=>a*(1+b),1)-1)*100])
+  );
+  return {{ cagr, sharpe, mdd: mdd*100, vol: std*Math.sqrt(12)*100, annualRet }};
+}}
+
+// ── 시뮬레이션 실행 ──────────────────────────────
+function runSimulation() {{
+  const btn = document.getElementById('run-btn');
+  btn.textContent = '⏳ 계산 중...';
+  btn.disabled = true;
+
+  setTimeout(() => {{
+    try {{
+      const weights = buildEtfWeights();
+      _lastWeights = weights;
+
+      // 포트폴리오
+      const port    = computePortfolioReturns(weights);
+      const portCum = computeCumulative(port.returns);
+      const portM   = computeMetrics(port.dates, port.returns);
+      const _si2010 = port.dates.findIndex(d => d >= '2010-01-01');
+      _portRet2010  = port.returns.slice(_si2010 >= 0 ? _si2010 : 0);
+
+      // 벤치마크: SPY
+      const spyW    = {{ SPY: 1.0 }};
+      const spyPort = computePortfolioReturns(spyW);
+      const spyCum  = computeCumulative(spyPort.returns);
+      const spyM    = computeMetrics(spyPort.dates, spyPort.returns);
+
+      // 벤치마크: 60/40 (SPY 60% + AGG 40%)
+      const bm6040  = computePortfolioReturns({{ SPY: 0.6, AGG: 0.4 }});
+      const bm6040C = computeCumulative(bm6040.returns);
+      const bm6040M = computeMetrics(bm6040.dates, bm6040.returns);
+
+      renderSimulation(port.dates, portCum, spyCum, bm6040C,
+                       portM, spyM, bm6040M, weights);
+      renderPerformance(port.dates, portCum, spyCum, bm6040C,
+                        portM, spyM, bm6040M);
+
+      // Tab 2 이동 + 스크롤 상단 복귀
+      document.querySelectorAll('.tab-content').forEach(el=>el.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(el=>el.classList.remove('active'));
+      document.getElementById('simulation').classList.add('active');
+      document.getElementById('sim-tab-btn').classList.add('active');
+      window.scrollTo({{top: 0, behavior: 'smooth'}});
+      // 탭이 visible 된 직후 Plotly 강제 리사이즈 (hidden 상태로 렌더링된 차트 복구)
+      setTimeout(() => {{
+        CHART_IDS.forEach(cid => {{
+          const el = document.getElementById(cid);
+          if (el && el.data && el.data.length) Plotly.relayout(cid, {{autosize: true}});
+        }});
+      }}, 100);
+    }} catch(e) {{
+      alert('시뮬레이션 오류: ' + e.message);
+      console.error(e);
+    }}
+    btn.textContent = '🚀 시뮬레이션 실행';
+    btn.disabled = false;
+  }}, 50);
+}}
+
+// ── 시뮬레이션 결과 렌더링 ───────────────────────
+function renderSimulation(dates, portCum, spyCum, bm6040C,
+                           portM, spyM, bm6040M, weights) {{
+  const startIdx = dates.findIndex(d => d >= '2010-01-01');
+  const sIdx = startIdx >= 0 ? startIdx : 0;
+  const d      = dates.slice(sIdx);
+  const pcRaw  = portCum.slice(sIdx);
+  const scRaw  = spyCum.slice(sIdx);
+  const bcRaw  = bm6040C.slice(sIdx);
+  // 동일 시작점 100 정규화
+  const pc = pcRaw.map(v => v / pcRaw[0] * 100);
+  const sc = scRaw.map(v => v / scRaw[0] * 100);
+  const bc = bcRaw.map(v => v / bcRaw[0] * 100);
+
+  // ── 1. 누적 수익률 차트
+  const traceCum = [
+    {{ x:d, y:pc, name:'모델 포트폴리오', line:{{color:'#7f5af0',width:2.5}} }},
+    {{ x:d, y:sc, name:'SPY (S&P500)',    line:{{color:'#2ecc71',width:1.5,dash:'dot'}} }},
+    {{ x:d, y:bc, name:'60/40',           line:{{color:'#f1c40f',width:1.5,dash:'dash'}} }},
+  ];
+  const layoutCum = {{
+    template:'plotly_dark', paper_bgcolor:'#111', plot_bgcolor:'#111',
+    height:320, margin:{{l:50,r:20,t:30,b:40}},
+    title:{{text:'누적 수익률 (2010~ 기준, 100 시작)', font:{{size:13}}}},
+    xaxis:{{showgrid:true,gridcolor:'#2c3e50'}},
+    yaxis:{{showgrid:true,gridcolor:'#2c3e50',title:'누적 수익률'}},
+    legend:{{orientation:'h',y:1.12,x:0.5,xanchor:'center'}},
+    font:{{family:'Malgun Gothic',size:12,color:'rgba(255,255,255,0.9)'}},
+  }};
+
+  // ── 2. 연간 수익률 바 차트
+  const years   = portM ? Object.keys(portM.annualRet).sort() : [];
+  const portYr  = years.map(y => portM.annualRet[y] || 0);
+  const spyYr   = years.map(y => spyM?.annualRet?.[y] || 0);
+  const traceYr = [
+    {{ x:years, y:portYr, name:'모델 MP', type:'bar',
+       text: portYr.map(v => (v>=0?'+':'')+v.toFixed(1)+'%'),
+       textposition:'outside', cliponaxis:false,
+       textfont:{{size:10}},
+       marker:{{color:portYr.map(v=>v>=0?'rgba(127,90,240,0.8)':'rgba(231,76,60,0.8)')}} }},
+    {{ x:years, y:spyYr,  name:'SPY',    type:'bar',
+       text: spyYr.map(v => (v>=0?'+':'')+v.toFixed(1)+'%'),
+       textposition:'outside', cliponaxis:false,
+       textfont:{{size:10}},
+       marker:{{color:'rgba(46,204,113,0.5)'}} }},
+  ];
+  const layoutYr = {{
+    template:'plotly_dark', paper_bgcolor:'#111', plot_bgcolor:'#111',
+    height:270, margin:{{l:50,r:20,t:40,b:40}}, barmode:'group',
+    title:{{text:'연간 수익률 비교', font:{{size:13}}}},
+    xaxis:{{showgrid:false}},
+    yaxis:{{showgrid:true,gridcolor:'#2c3e50',tickformat:'.1f',ticksuffix:'%',title:'연간 수익률'}},
+    legend:{{orientation:'h',y:1.12,x:0.5,xanchor:'center'}},
+    font:{{family:'Malgun Gothic',size:12,color:'rgba(255,255,255,0.9)'}},
+  }};
+
+  // ── 3. MDD 차트
+  function calcDrawdown(cumArr) {{
+    let peak=cumArr[0], dds=[];
+    for (const v of cumArr) {{
+      if (v>peak) peak=v;
+      dds.push(((v-peak)/peak)*100);
+    }}
+    return dds;
+  }}
+  const traceDD = [
+    {{ x:d, y:calcDrawdown(pc), name:'모델 MP', fill:'tozeroy',
+       fillcolor:'rgba(127,90,240,0.15)', line:{{color:'#7f5af0',width:1.5}} }},
+    {{ x:d, y:calcDrawdown(sc), name:'SPY',     fill:'tozeroy',
+       fillcolor:'rgba(46,204,113,0.08)', line:{{color:'#2ecc71',width:1,dash:'dot'}} }},
+  ];
+  const layoutDD = {{
+    template:'plotly_dark', paper_bgcolor:'#111', plot_bgcolor:'#111',
+    height:200, margin:{{l:50,r:20,t:30,b:40}},
+    title:{{text:'낙폭 (Drawdown)', font:{{size:13}}}},
+    xaxis:{{showgrid:true,gridcolor:'#2c3e50'}},
+    yaxis:{{showgrid:true,gridcolor:'#2c3e50',ticksuffix:'%',autorange:'reversed'}},
+    legend:{{orientation:'h',y:1.15,x:0.5,xanchor:'center'}},
+    font:{{family:'Malgun Gothic',size:12,color:'rgba(255,255,255,0.9)'}},
+  }};
+
+  // ── 4. 포트폴리오 구성 파이
+  const wEntries = Object.entries(weights).sort((a,b)=>b[1]-a[1]);
+  const pieColors = ['#7f5af0','#2ecc71','#f1c40f','#e74c3c','#3498db',
+                     '#e67e22','#1abc9c','#9b59b6','#5dade2','#f39c12',
+                     '#aed6f1','#27ae60'];
+  const pieFig = {{
+    data: [{{ type:'pie',
+      labels: wEntries.map(([t])=>t),
+      values: wEntries.map(([,w])=>parseFloat((w*100).toFixed(2))),
+      texttemplate:'%{{label}}<br><b>%{{value:.1f}}%</b>',
+      marker:{{colors:pieColors.slice(0,wEntries.length),
+               line:{{color:'#111',width:2}}}},
+      hole:0.4,
+      hovertemplate:'%{{label}}: %{{value:.1f}}%<extra></extra>',
+    }}],
+    layout:{{
+      template:'plotly_dark', paper_bgcolor:'#161622', plot_bgcolor:'#161622',
+      autosize:true, height:360, margin:{{l:20,r:20,t:40,b:10}},
+      showlegend:false,
+      font:{{family:'Malgun Gothic',size:11,color:'rgba(255,255,255,0.9)'}},
+      title:{{text:'최종 ETF 구성',font:{{size:13}},x:0.5}},
+    }}
+  }};
+
+  // ── 지표 카드 HTML
+  function fmtPct(v,dig=1) {{ return v==null?'N/A':v.toFixed(dig)+'%'; }}
+  function fmtN(v,dig=2)   {{ return v==null?'N/A':v.toFixed(dig); }}
+  function metricCard(label, val, color='rgba(255,255,255,0.87)') {{
+    return `<div class="sim-metric-card">
+      <div class="sim-metric-label">${{label}}</div>
+      <div class="sim-metric-value" style="color:${{color}}">${{val}}</div>
+    </div>`;
+  }}
+
+  const pColor = v => v>=0?'#2ecc71':'#e74c3c';
+  const cards = `
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px;">
+      ${{metricCard('CAGR (모델)', fmtPct(portM?.cagr), pColor(portM?.cagr||0))}}
+      ${{metricCard('샤프비율 (모델)', fmtN(portM?.sharpe))}}
+      ${{metricCard('최대낙폭 (모델)', fmtPct(-(portM?.mdd||0)), '#e74c3c')}}
+      ${{metricCard('연변동성 (모델)', fmtPct(portM?.vol), '#f1c40f')}}
+    </div>
+    <div style="overflow-x:auto;margin-bottom:20px;">
+      <table style="width:100%;border-collapse:collapse;font-size:13px;">
+        <tr style="border-bottom:2px solid #2c3e50;">
+          <th style="padding:8px 12px;text-align:left;">구분</th>
+          <th style="padding:8px 12px;text-align:right;">CAGR</th>
+          <th style="padding:8px 12px;text-align:right;">샤프비율</th>
+          <th style="padding:8px 12px;text-align:right;">최대낙폭</th>
+          <th style="padding:8px 12px;text-align:right;">연변동성</th>
+        </tr>
+        ${{[
+          ['🟣 모델 포트폴리오', portM],
+          ['🟢 SPY (S&P500)',   spyM],
+          ['🟡 60/40',          bm6040M],
+        ].map(([n,m]) => `
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:8px 12px;font-weight:bold;">${{n}}</td>
+            <td style="padding:8px 12px;text-align:right;color:${{pColor(m?.cagr||0)}};">${{fmtPct(m?.cagr)}}</td>
+            <td style="padding:8px 12px;text-align:right;">${{fmtN(m?.sharpe)}}</td>
+            <td style="padding:8px 12px;text-align:right;color:#e74c3c;">${{fmtPct(-(m?.mdd||0))}}</td>
+            <td style="padding:8px 12px;text-align:right;color:#f1c40f;">${{fmtPct(m?.vol)}}</td>
+          </tr>`).join('')}}
+      </table>
+    </div>`;
+
+  // ── DOM 업데이트
+  const simDiv = document.getElementById('sim-content');
+  simDiv.innerHTML = `
+    <div class="content">
+      <div class="section">
+        <h2 class="section-title">🥧 최종 포트폴리오 구성</h2>
+        <div style="display:flex;gap:0;align-items:flex-start;flex-wrap:wrap;">
+          <div style="flex:0 0 400px;min-width:360px;max-width:420px;">
+            <div id="chart-pie"></div>
+            <div id="style-summary" style="display:flex;flex-wrap:wrap;gap:6px;
+                 justify-content:center;padding:0 10px 12px;"></div>
+          </div>
+          <div style="flex:1;min-width:320px;overflow-x:auto;padding-left:20px;">
+            <table style="width:100%;border-collapse:collapse;font-size:12px;">
+              <tr style="border-bottom:2px solid #2c3e50;">
+                <th style="padding:7px 12px;text-align:left;">ETF</th>
+                <th style="padding:7px 12px;text-align:left;">구분</th>
+                <th style="padding:7px 12px;text-align:right;">비중</th>
+                <th style="padding:7px 12px;text-align:left;">설명</th>
+              </tr>
+              ${{wEntries.map(([t,w]) => {{
+                const info  = ETF_INFO[t] || {{}};
+                const style = ETF_STYLE_MAP[t] || '위성';
+                const sc    = STYLE_COLORS[style] || '#aaa';
+                return `<tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+                  <td style="padding:7px 12px;font-weight:bold;color:#f1c40f;font-family:monospace;">${{t}}<span style="color:rgba(255,255,255,0.4);font-size:10px;font-family:sans-serif;font-weight:normal;margin-left:5px;">${{info.desc||''}}</span></td>
+                  <td style="padding:7px 12px;">
+                    <span style="color:${{sc}};font-weight:bold;font-size:11px;">${{style}}</span>
+                  </td>
+                  <td style="padding:7px 12px;text-align:right;font-weight:bold;">${{(w*100).toFixed(1)}}%</td>
+                  <td style="padding:7px 12px;color:rgba(255,255,255,0.5);font-size:11px;">${{info.name||''}} · ${{info.desc||''}}</td>
+                </tr>`;
+              }}).join('')}}
+            </table>
+            <p style="margin-top:8px;font-size:11px;color:rgba(255,255,255,0.3);">
+              ※ 분기별 리밸런싱 가정, 수수료·세금 미반영. 과거 성과가 미래를 보장하지 않습니다.<br>
+              ※ 가격 데이터 없는 ETF는 시뮬레이션에서 제외되며 비중이 자동 재조정됩니다.
+            </p>
+          </div>
+        </div>
+      </div>
+      <div class="section">
+        <h2 class="section-title">📊 백테스트 결과 (2010~ 기준, 분기별 리밸런싱)</h2>
+        ${{cards}}
+        <div id="chart-cum"></div>
+        <div id="chart-yr" style="margin-top:16px;"></div>
+        <div id="chart-dd" style="margin-top:16px;"></div>
+      </div>
+    </div>`;
+
+  const cfg = {{displayModeBar:false, responsive:true}};
+  Plotly.newPlot('chart-cum',  traceCum,  layoutCum,  cfg);
+  Plotly.newPlot('chart-yr',   traceYr,   layoutYr,   cfg);
+  Plotly.newPlot('chart-dd',   traceDD,   layoutDD,   cfg);
+  Plotly.newPlot('chart-pie',  pieFig.data, pieFig.layout, cfg);
+
+  // ── 스타일별 합산 비중 뱃지 ──────────────────
+  const styleTotals = {{}};
+  for (const [t, w] of Object.entries(weights)) {{
+    const s = ETF_STYLE_MAP[t] || '기타';
+    styleTotals[s] = (styleTotals[s] || 0) + w * 100;
+  }}
+  const STYLE_ORDER = ['성장주','가치주','방어주','현금','대체자산','혼합','기타'];
+  const summaryEl = document.getElementById('style-summary');
+  if (summaryEl) {{
+    summaryEl.innerHTML = STYLE_ORDER
+      .filter(s => styleTotals[s] > 0)
+      .map(s => {{
+        const c   = STYLE_COLORS[s] || '#aaa';
+        const pct = styleTotals[s].toFixed(1);
+        return `<span
+          onmouseenter="highlightPieStyle('${{s}}')"
+          onmouseleave="resetPieStyle()"
+          style="background:${{c}}22;border:1px solid ${{c}};border-radius:5px;
+                 padding:4px 12px;font-size:12px;color:${{c}};font-weight:bold;
+                 white-space:nowrap;cursor:pointer;transition:background 0.15s;"
+          >${{s}}&nbsp;${{pct}}%</span>`;
+      }}).join('');
+  }}
+
+  // 새 파이 렌더 시 원본 색상 캐시 초기화
+  _pieOrigColors = null;
+}}
+
+// ── 파이차트 스타일 하이라이트 ───────────────────
+let _pieOrigColors = null;
+
+function highlightPieStyle(style) {{
+  const pieEl = document.getElementById('chart-pie');
+  if (!pieEl || !pieEl.data || !pieEl.data.length) return;
+  const labels = pieEl.data[0].labels;
+
+  // 첫 호출 시 원본 색상 저장
+  if (!_pieOrigColors) _pieOrigColors = [...pieEl.data[0].marker.colors];
+
+  const pull = labels.map(t => (ETF_STYLE_MAP[t] || '기타') === style ? 0.08 : 0);
+  const colors = _pieOrigColors.map((c, i) =>
+    (ETF_STYLE_MAP[labels[i]] || '기타') === style ? c : c + '33'
+  );
+  Plotly.restyle('chart-pie', {{'pull': [pull], 'marker.colors': [colors]}}, [0]);
+}}
+
+function resetPieStyle() {{
+  const pieEl = document.getElementById('chart-pie');
+  if (!pieEl || !pieEl.data || !pieEl.data.length || !_pieOrigColors) return;
+  const n = pieEl.data[0].labels.length;
+  Plotly.restyle('chart-pie', {{
+    'pull':          [new Array(n).fill(0)],
+    'marker.colors': [_pieOrigColors],
+  }}, [0]);
+}}
+
+// ══════════════════════════════════════════════
+// 시뮬레이션 성과 탭 (Tab 3)
+// ══════════════════════════════════════════════
+let _perfDates = null, _perfPort = null, _perfSpy = null, _perfBm = null;
+let _fullDates = null, _fullPort = null, _fullSpy = null, _fullBm = null; // 2010 이전 포함 전체
+let _selPt1 = null;   // 기간 선택 첫 번째 클릭 날짜
+
+// ── 트레일링 수익률 계산 ──────────────────────
+function trailingReturn(cumArr, dates, months) {{
+  if (!cumArr || !cumArr.length) return null;
+  const lastDate = new Date(dates[dates.length - 1]);
+  const cutoff   = new Date(lastDate);
+  cutoff.setMonth(cutoff.getMonth() - months);
+  let idx = -1;
+  for (let i = dates.length - 1; i >= 0; i--) {{
+    if (new Date(dates[i]) <= cutoff) {{ idx = i; break; }}
+  }}
+  if (idx < 0 || cumArr[idx] === 0) return null;
+  return (cumArr[cumArr.length - 1] / cumArr[idx] - 1) * 100;
+}}
+
+// 두 날짜 사이 수익률
+function returnBetween(cumArr, dates, d1, d2) {{
+  const t1 = new Date(d1 < d2 ? d1 : d2).getTime();
+  const t2 = new Date(d1 < d2 ? d2 : d1).getTime();
+  let i1 = -1, i2 = -1;
+  for (let i = 0; i < dates.length; i++) {{
+    const t = new Date(dates[i]).getTime();
+    if (i1 < 0 && t >= t1) i1 = i;
+    if (t <= t2) i2 = i;
+  }}
+  if (i1 < 0 || i2 < 0 || i1 >= i2 || cumArr[i1] === 0) return null;
+  return (cumArr[i2] / cumArr[i1] - 1) * 100;
+}}
+
+// ── 팝업 표시/숨김 ──────────────────────────────
+function showPerfPopup(html, clientX, clientY) {{
+  const p = document.getElementById('perf-popup');
+  p.innerHTML = html;
+  p.style.display = 'block';
+  const pw = 240, ph = 120;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  p.style.left = Math.min(clientX + 16, vw - pw - 8) + 'px';
+  p.style.top  = Math.max(clientY - 20, 8) + 'px';
+  if (clientY + ph > vh) p.style.top = Math.max(clientY - ph - 8, 8) + 'px';
+}}
+function hidePerfPopup() {{
+  document.getElementById('perf-popup').style.display = 'none';
+}}
+document.addEventListener('keydown', e => {{ if (e.key === 'Escape') resetPerfSel(); }});
+// 스크롤 시 팝업 숨기기 (capture:true 로 모든 스크롤 이벤트 캐치)
+window.addEventListener('scroll', hidePerfPopup, true);
+
+function resetPerfSel() {{
+  _selPt1 = null;
+  hidePerfPopup();
+  const el = document.getElementById('perf-chart-cum');
+  if (el && el.data) Plotly.relayout('perf-chart-cum', {{shapes: []}});
+}}
+
+// ── 기간 선택 클릭 핸들러 ─────────────────────
+function attachPerfClick() {{
+  const el = document.getElementById('perf-chart-cum');
+  if (!el) return;
+  el.on('plotly_click', function(evData) {{
+    if (!evData.points.length) return;
+    const xDate = evData.points[0].x;
+    const mx = evData.event.clientX, my = evData.event.clientY;
+    if (!_selPt1) {{
+      _selPt1 = xDate;
+      Plotly.relayout('perf-chart-cum', {{
+        shapes: [{{type:'line',x0:xDate,x1:xDate,y0:0,y1:1,yref:'paper',
+                  line:{{color:'#f1c40f',width:1.5,dash:'dot'}}}}]
+      }});
+      showPerfPopup(
+        `<div style="color:#f1c40f;font-weight:bold;margin-bottom:6px;">📍 시작: ${{xDate.slice(0,7)}}</div>
+         <div style="color:rgba(255,255,255,0.5);font-size:11px;">종료 시점을 클릭하세요<br>
+         <span onclick="resetPerfSel()" style="cursor:pointer;color:#e74c3c;">✕ 초기화</span></div>`,
+        mx, my
+      );
+    }} else {{
+      const d1 = _selPt1, d2 = xDate;
+      const rp  = returnBetween(_perfPort, _perfDates, d1, d2);
+      const rs  = returnBetween(_perfSpy,  _perfDates, d1, d2);
+      const rb  = returnBetween(_perfBm,   _perfDates, d1, d2);
+      const fmt = v => v === null ? 'N/A' :
+        `<span style="color:${{v>=0?'#2ecc71':'#e74c3c'}};font-weight:bold;">${{v>=0?'+':''}}${{v.toFixed(2)}}%</span>`;
+      const sd = (d1<d2?d1:d2).slice(0,7), ed = (d1<d2?d2:d1).slice(0,7);
+      Plotly.relayout('perf-chart-cum', {{
+        shapes: [
+          {{type:'line',x0:sd,x1:sd,y0:0,y1:1,yref:'paper',line:{{color:'#f1c40f',width:1.5,dash:'dot'}}}},
+          {{type:'line',x0:ed,x1:ed,y0:0,y1:1,yref:'paper',line:{{color:'#e74c3c',width:1.5,dash:'dot'}}}},
+          {{type:'rect',x0:sd,x1:ed,y0:0,y1:1,yref:'paper',
+            fillcolor:'rgba(255,255,255,0.04)',line:{{width:0}}}}
+        ]
+      }});
+      showPerfPopup(
+        `<div style="font-weight:bold;margin-bottom:8px;color:rgba(255,255,255,0.7);">
+           📅 ${{sd}} → ${{ed}}</div>
+         <table style="width:100%;border-collapse:collapse;font-size:12px;">
+           <tr><td style="color:rgba(255,255,255,0.4);padding:2px 6px;">모델 포트</td>
+               <td style="text-align:right;padding:2px 6px;">${{fmt(rp)}}</td></tr>
+           <tr><td style="color:rgba(255,255,255,0.4);padding:2px 6px;">SPY</td>
+               <td style="text-align:right;padding:2px 6px;">${{fmt(rs)}}</td></tr>
+           <tr><td style="color:rgba(255,255,255,0.4);padding:2px 6px;">60/40</td>
+               <td style="text-align:right;padding:2px 6px;">${{fmt(rb)}}</td></tr>
+         </table>
+         <div style="margin-top:8px;font-size:11px;color:rgba(255,255,255,0.3);">
+           <span onclick="resetPerfSel()" style="cursor:pointer;color:#e74c3c;">✕ 초기화</span>
+         </div>`,
+        mx, my
+      );
+      _selPt1 = null;
+    }}
+  }});
+  // 차트 바깥 클릭시 팝업 닫기
+  el.on('plotly_doubleclick', resetPerfSel);
+}}
+
+// ── 성과 탭 렌더 ───────────────────────────────
+function renderPerformance(dates, portCum, spyCum, bm6040C,
+                           portM, spyM, bm6040M) {{
+  // 2010 이후 슬라이스 + 100 재정규화 (renderSimulation 과 동일 기준)
+  const sIdx  = dates.findIndex(d => d >= '2010-01-01');
+  const si    = sIdx >= 0 ? sIdx : 0;
+  const d     = dates.slice(si);
+  const pcRaw = portCum.slice(si), scRaw = spyCum.slice(si), bcRaw = bm6040C.slice(si);
+  const pc    = pcRaw.map(v => v / pcRaw[0] * 100);
+  const sc    = scRaw.map(v => v / scRaw[0] * 100);
+  const bc    = bcRaw.map(v => v / bcRaw[0] * 100);
+
+  _perfDates = d; _perfPort = pc;
+  _perfSpy   = sc; _perfBm  = bc;
+  _selPt1    = null;
+  // 스트레스 테스트용 — 2010 이전 포함 전체 데이터 (정규화 없이 원본)
+  _fullDates = dates; _fullPort = portCum; _fullSpy = spyCum; _fullBm = bm6040C;
+
+  // 성과 지표 저장 (saveSimulation에서 사용)
+  _portMetrics = portM; _spyMetrics = spyM; _bmMetrics = bm6040M;
+
+  // ─ 1. 누적 수익률 차트 ─
+  const traceCum = [
+    {{x:d, y:pc, name:'모델 포트폴리오',
+      line:{{color:'#7f5af0',width:2.5}}, hovertemplate:'%{{x|%Y-%m}}<br>%{{y:.1f}}<extra>모델</extra>'}},
+    {{x:d, y:sc, name:'SPY (S&P500)',
+      line:{{color:'#2ecc71',width:1.5,dash:'dot'}}, hovertemplate:'%{{x|%Y-%m}}<br>%{{y:.1f}}<extra>SPY</extra>'}},
+    {{x:d, y:bc, name:'60/40',
+      line:{{color:'#f1c40f',width:1.5,dash:'dash'}}, hovertemplate:'%{{x|%Y-%m}}<br>%{{y:.1f}}<extra>60/40</extra>'}},
+  ];
+  const layoutCum = {{
+    template:'plotly_dark', paper_bgcolor:'#111', plot_bgcolor:'#111',
+    height:360, margin:{{l:55,r:20,t:40,b:50}},
+    title:{{text:'누적 수익률 (2010~ 기준, 100 시작) — 클릭으로 기간 선택', font:{{size:13}}}},
+    xaxis:{{showgrid:true, gridcolor:'#1e2d3d', fixedrange:false,
+            rangeslider:{{visible:false}}}},
+    yaxis:{{showgrid:true, gridcolor:'#1e2d3d', title:'누적 수익률', fixedrange:true}},
+    legend:{{orientation:'h',y:1.12,x:0.5,xanchor:'center'}},
+    font:{{family:'Malgun Gothic',size:12,color:'rgba(255,255,255,0.9)'}},
+    dragmode:'pan',
+  }};
+  const cfg = {{scrollZoom:true, displayModeBar:true,
+    modeBarButtonsToRemove:['zoom2d','zoomIn2d','zoomOut2d','autoScale2d',
+                            'lasso2d','select2d','toImage'],
+    responsive:true}};
+
+  // ─ 2. 성과 테이블 HTML (가로: 행=포트폴리오, 열=기간) ─
+  const PERIODS = [
+    [1,'1M'],[3,'3M'],[6,'6M'],[12,'1Y'],
+    [24,'2Y'],[36,'3Y'],[60,'5Y'],[120,'10Y'],
+  ];
+
+  function fmtRet(v) {{
+    if (v === null || isNaN(v)) return '<span style="color:rgba(255,255,255,0.25);">-</span>';
+    const c = v >= 0 ? '#2ecc71' : '#e74c3c';
+    return `<span style="color:${{c}};font-weight:bold;">${{v>=0?'+':''}}${{v.toFixed(1)}}%</span>`;
+  }}
+  function fmtStat(v, suffix='', invert=false) {{
+    if (v === null || v === undefined || isNaN(v))
+      return '<span style="color:rgba(255,255,255,0.25);">-</span>';
+    const pos = invert ? v<=0 : v>=0;
+    const c   = pos ? '#2ecc71' : '#e74c3c';
+    return `<span style="color:${{c}};font-weight:bold;">${{v>=0&&!invert?'+':''}}${{v.toFixed(2)}}${{suffix}}</span>`;
+  }}
+  function fmtMDD(v) {{  // MDD 항상 빨간색
+    if (v === null || v === undefined || isNaN(v))
+      return '<span style="color:rgba(255,255,255,0.25);">-</span>';
+    return `<span style="color:#e74c3c;font-weight:bold;">-${{Math.abs(v).toFixed(2)}}%</span>`;
+  }}
+
+  const TH  = 'padding:7px 10px;text-align:right;font-size:11px;white-space:nowrap;';
+  const THL = 'padding:7px 10px;text-align:left;font-size:11px;white-space:nowrap;';
+  const TD  = 'padding:7px 10px;text-align:right;border-bottom:1px solid rgba(255,255,255,0.05);font-size:12px;white-space:nowrap;';
+  const TDL = 'padding:7px 10px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.05);font-size:12px;white-space:nowrap;';
+  const SEP = 'border-left:2px solid rgba(255,255,255,0.12);';
+
+  // 각 시리즈별 트레일링 수익률 계산
+  const seriesList = [
+    {{'label':'모델 포트폴리오', 'color':'#7f5af0', 'cum':portCum, 'm':portM}},
+    {{'label':'SPY (S&P500)',   'color':'#2ecc71', 'cum':spyCum,  'm':spyM}},
+    {{'label':'60/40',          'color':'#f1c40f', 'cum':bm6040C, 'm':bm6040M}},
+  ];
+
+  // 헤더: 트레일링 | 전체기간 지표
+  const nPeriod = PERIODS.length; // 8
+  const nStat   = 4;              // 연환산·변동성·MDD·샤프
+  const headerRow1 = `<tr>
+    <th style="${{THL}}" rowspan="2">구분</th>
+    <th colspan="${{nPeriod}}" style="${{TH}}border-bottom:1px solid #2c3e50;
+        text-align:center;background:rgba(255,255,255,0.03);color:rgba(255,255,255,0.5);">
+      트레일링 수익률</th>
+    <th colspan="${{nStat}}"  style="${{TH}}border-bottom:1px solid #2c3e50;
+        text-align:center;background:rgba(255,255,255,0.03);color:rgba(255,255,255,0.5);${{SEP}}">
+      전체 기간 지표 (2010~)</th>
+  </tr>`;
+  const headerRow2 = `<tr>
+    ${{PERIODS.map(([,l])=>`<th style="${{TH}}border-bottom:2px solid #2c3e50;">${{l}}</th>`).join('')}}
+    <th style="${{TH}}border-bottom:2px solid #2c3e50;${{SEP}}">연환산</th>
+    <th style="${{TH}}border-bottom:2px solid #2c3e50;">변동성</th>
+    <th style="${{TH}}border-bottom:2px solid #2c3e50;">MDD</th>
+    <th style="${{TH}}border-bottom:2px solid #2c3e50;">샤프</th>
+  </tr>`;
+
+  const dataRows = seriesList.map(s => {{
+    const retCells = PERIODS.map(([m]) =>
+      `<td style="${{TD}}">${{fmtRet(trailingReturn(s.cum, dates, m))}}</td>`
+    ).join('');
+    const cagr   = fmtStat(s.m?.cagr,   '%', false);
+    const vol    = fmtStat(s.m?.vol,    '%', true);
+    const mdd    = fmtMDD(s.m?.mdd);
+    const sharpe = fmtStat(s.m?.sharpe, '',  false);
+    return `<tr>
+      <td style="${{TDL}}"><span style="color:${{s.color}};font-weight:bold;">■</span>&nbsp;${{s.label}}</td>
+      ${{retCells}}
+      <td style="${{TD}}${{SEP}}">${{cagr}}</td>
+      <td style="${{TD}}">${{vol}}</td>
+      <td style="${{TD}}">${{mdd}}</td>
+      <td style="${{TD}}">${{sharpe}}</td>
+    </tr>`;
+  }}).join('');
+
+  const tableHtml = `
+    <table style="width:100%;border-collapse:collapse;">
+      <thead>${{headerRow1}}${{headerRow2}}</thead>
+      <tbody>${{dataRows}}</tbody>
+    </table>`;
+
+  // ─ 3. 탭 콘텐츠 렌더 ─
+  document.getElementById('perf-content').innerHTML = `
+    <div class="section">
+      <h2 class="section-title">📈 누적 수익률 추이</h2>
+      <p style="font-size:12px;color:rgba(255,255,255,0.35);margin:0 0 8px;">
+        🖱 드래그: 좌우 이동 &nbsp;|&nbsp; 스크롤: 기간 확대/축소 &nbsp;|&nbsp;
+        클릭: 시작점 지정 → 재클릭: 종료점 지정 → 구간 수익률 표시 &nbsp;|&nbsp; ESC: 초기화
+      </p>
+      <div id="perf-chart-cum"></div>
+    </div>
+    <div class="section">
+      <h2 class="section-title">📋 기간별 성과 요약</h2>
+      <div style="overflow-x:auto;">${{tableHtml}}</div>
+      <p style="margin-top:8px;font-size:11px;color:rgba(255,255,255,0.3);">
+        ※ 분기별 리밸런싱 가정, 수수료·세금 미반영. 트레일링 수익률은 현재 기준 과거 N개월. MDD·샤프·변동성은 2010년 이후 전체 기간 기준.
+      </p>
+    </div>
+    <div class="section">
+      <h2 class="section-title">🚨 위기 구간 성과 분석</h2>
+      <div id="stress-hist-chart"></div>
+      <div id="stress-hist-table" style="overflow-x:auto;margin-top:16px;"></div>
+    </div>
+    <div class="section">
+      <h2 class="section-title">⚡ 가상 충격 시나리오</h2>
+      <div style="display:flex;flex-wrap:wrap;gap:24px;margin-bottom:20px;">
+        <div style="flex:1;min-width:200px;">
+          <label style="font-size:12px;color:rgba(255,255,255,0.6);">S&amp;P500 변동</label>
+          <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
+            <input type="range" id="shock-sp500" min="-50" max="20" value="0" step="1"
+              oninput="updateShock()" style="flex:1;">
+            <span id="shock-sp500-val" style="min-width:50px;text-align:right;font-weight:bold;">0%</span>
+          </div>
+        </div>
+        <div style="flex:1;min-width:200px;">
+          <label style="font-size:12px;color:rgba(255,255,255,0.6);">금리 변동 (bp)</label>
+          <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
+            <input type="range" id="shock-rate" min="-200" max="300" value="0" step="25"
+              oninput="updateShock()" style="flex:1;">
+            <span id="shock-rate-val" style="min-width:60px;text-align:right;font-weight:bold;">0bp</span>
+          </div>
+        </div>
+        <div style="flex:1;min-width:200px;">
+          <label style="font-size:12px;color:rgba(255,255,255,0.6);">달러 변동</label>
+          <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
+            <input type="range" id="shock-usd" min="-20" max="20" value="0" step="1"
+              oninput="updateShock()" style="flex:1;">
+            <span id="shock-usd-val" style="min-width:50px;text-align:right;font-weight:bold;">0%</span>
+          </div>
+        </div>
+        <div style="flex:1;min-width:200px;">
+          <label style="font-size:12px;color:rgba(255,255,255,0.6);">유가 변동</label>
+          <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
+            <input type="range" id="shock-oil" min="-50" max="50" value="0" step="5"
+              oninput="updateShock()" style="flex:1;">
+            <span id="shock-oil-val" style="min-width:50px;text-align:right;font-weight:bold;">0%</span>
+          </div>
+        </div>
+      </div>
+      <div id="shock-result" style="text-align:center;padding:20px 0;">
+        <span style="color:rgba(255,255,255,0.3);">시뮬레이션 실행 후 확인하세요.</span>
+      </div>
+    </div>
+    <div class="section">
+      <h2 class="section-title">🎲 몬테카를로 시뮬레이션</h2>
+      <div style="margin-bottom:14px;display:flex;align-items:center;gap:12px;">
+        <label style="font-size:12px;color:rgba(255,255,255,0.6);">시뮬레이션 기간:</label>
+        <select id="mc-horizon" onchange="renderMonteCarlo()"
+          style="background:#1e1e2e;border:1px solid rgba(255,255,255,0.2);color:white;
+                 padding:5px 10px;border-radius:5px;font-size:12px;">
+          <option value="36">3년 (36개월)</option>
+          <option value="60" selected>5년 (60개월)</option>
+          <option value="120">10년 (120개월)</option>
+        </select>
+      </div>
+      <div id="stress-mc-chart"></div>
+      <div id="mc-stats"></div>
+    </div>
+    `;
+
+  Plotly.newPlot('perf-chart-cum', traceCum, layoutCum, cfg);
+  setTimeout(() => {{
+    attachPerfClick();
+    Plotly.relayout('perf-chart-cum', {{autosize:true}});
+    renderHistoricalStress();
+    updateShock();
+    renderMonteCarlo();
+  }}, 80);
+}}
+
+// ══════════════════════════════════════════════
+// 스트레스 테스트
+// ══════════════════════════════════════════════
+
+const CRISIS_PERIODS = [
+  {{label:'닷컴버블',     start:'2000-03-01', end:'2002-10-01'}},
+  {{label:'금융위기',     start:'2007-10-01', end:'2009-03-01'}},
+  {{label:'유럽재정위기', start:'2010-04-01', end:'2012-06-01'}},
+  {{label:'미중무역전쟁', start:'2018-09-01', end:'2019-01-01'}},
+  {{label:'코로나19',     start:'2020-02-01', end:'2020-03-01'}},
+  {{label:'인플레·긴축', start:'2022-01-01', end:'2022-12-01'}},
+];
+
+// ETF별 팩터 민감도: sp=S&P500 베타, rate=금리 100bp당, usd=달러 10%당, oil=유가 10%당
+const ETF_SENS = {{
+  QQQ: {{sp:1.20, rate:-0.08, usd: 0.02, oil:-0.02}},
+  VUG: {{sp:1.10, rate:-0.07, usd: 0.02, oil:-0.02}},
+  IWF: {{sp:1.10, rate:-0.07, usd: 0.02, oil:-0.02}},
+  VTV: {{sp:0.90, rate:-0.03, usd: 0.01, oil: 0.03}},
+  IWD: {{sp:0.90, rate:-0.03, usd: 0.01, oil: 0.03}},
+  IVE: {{sp:0.90, rate:-0.03, usd: 0.01, oil: 0.03}},
+  XLV: {{sp:0.70, rate:-0.03, usd: 0.01, oil:-0.01}},
+  XLP: {{sp:0.55, rate:-0.04, usd: 0.00, oil:-0.01}},
+  XLU: {{sp:0.55, rate:-0.10, usd: 0.00, oil:-0.01}},
+  SHV: {{sp:0.00, rate: 0.01, usd: 0.00, oil: 0.00}},
+  BIL: {{sp:0.00, rate: 0.01, usd: 0.00, oil: 0.00}},
+  GLD: {{sp:0.05, rate:-0.05, usd:-0.08, oil: 0.03}},
+  TIP: {{sp:0.10, rate:-0.03, usd:-0.02, oil: 0.02}},
+  SPY: {{sp:1.00, rate:-0.05, usd: 0.01, oil: 0.02}},
+  AGG: {{sp:0.10, rate:-0.08, usd:-0.01, oil: 0.00}},
+}};
+
+function crisisStats(dates, cumArr, sd, ed) {{
+  const si = dates.findIndex(d => d >= sd);
+  const ei = dates.findIndex(d => d >= ed);
+  if (si < 0 || ei < 0 || ei <= si) return {{ret:null, mdd:null}};
+  const ret = (cumArr[ei] / cumArr[si] - 1) * 100;
+  let peak = cumArr[si], mdd = 0;
+  for (let i = si; i <= ei; i++) {{
+    if (cumArr[i] > peak) peak = cumArr[i];
+    const dd = (cumArr[i] - peak) / peak * 100;
+    if (dd < mdd) mdd = dd;
+  }}
+  return {{ret: ret.toFixed(1), mdd: mdd.toFixed(1)}};
+}}
+
+function renderHistoricalStress() {{
+  if (!_fullDates || !_fullPort) return;
+  const series = [
+    {{label:'모델 포트폴리오', color:'#7f5af0', cum:_fullPort}},
+    {{label:'SPY (S&P500)',   color:'#2ecc71', cum:_fullSpy}},
+    {{label:'60/40',          color:'#f1c40f', cum:_fullBm}},
+  ];
+  const traces = [];
+  series.forEach(s => {{
+    const vals = CRISIS_PERIODS.map(c => {{
+      const r = crisisStats(_fullDates, s.cum, c.start, c.end);
+      return r.ret !== null ? parseFloat(r.ret) : 0;
+    }});
+    traces.push({{
+      type:'bar', name:s.label,
+      x: CRISIS_PERIODS.map(c => c.label),
+      y: vals,
+      marker:{{color:s.color, opacity:0.85}},
+    }});
+  }});
+  Plotly.newPlot('stress-hist-chart', traces, {{
+    template:'plotly_dark', paper_bgcolor:'#111', plot_bgcolor:'#111',
+    height:300, margin:{{l:50,r:20,t:40,b:60}},
+    title:{{text:'위기 구간별 수익률 비교', font:{{size:13}}}},
+    barmode:'group',
+    xaxis:{{tickangle:-20}},
+    yaxis:{{title:'수익률 (%)', zeroline:true, zerolinecolor:'rgba(255,255,255,0.2)'}},
+    legend:{{orientation:'h',y:1.12,x:0.5,xanchor:'center'}},
+    font:{{family:'Malgun Gothic',size:11,color:'rgba(255,255,255,0.9)'}},
+  }}, {{responsive:true, displayModeBar:false}});
+
+  const TH  = 'padding:6px 10px;font-size:11px;text-align:right;border-bottom:1px solid #2c3e50;color:white;font-weight:bold;';
+  const THL = 'padding:6px 10px;font-size:11px;text-align:left;border-bottom:1px solid #2c3e50;color:white;font-weight:bold;';
+  const TD  = 'padding:6px 10px;font-size:11px;text-align:right;border-bottom:1px solid rgba(255,255,255,0.05);color:white;font-weight:bold;';
+  const TDL = 'padding:6px 10px;font-size:11px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.05);color:white;font-weight:bold;';
+
+  const hdr = `<tr><th style="${{THL}}">위기 구간</th>` +
+    series.map(s => `<th colspan="2" style="${{TH}}text-align:center;color:${{s.color}};">${{s.label}}</th>`).join('') + '</tr>' +
+    '<tr><th></th>' + series.map(() => `<th style="${{TH}}">수익률</th><th style="${{TH}}">MDD</th>`).join('') + '</tr>';
+
+  const rows = CRISIS_PERIODS.map(c => {{
+    const cells = series.map(s => {{
+      const r = crisisStats(_fullDates, s.cum, c.start, c.end);
+      const retStr = r.ret !== null
+        ? `<span style="color:${{parseFloat(r.ret)>=0?'#2ecc71':'#e74c3c'}};font-weight:bold;">${{parseFloat(r.ret)>=0?'+':''}}${{r.ret}}%</span>`
+        : '-';
+      const mddStr = r.mdd !== null
+        ? `<span style="color:#e74c3c;font-weight:bold;">-${{Math.abs(parseFloat(r.mdd)).toFixed(1)}}%</span>`
+        : '-';
+      return `<td style="${{TD}}">${{retStr}}</td><td style="${{TD}}">${{mddStr}}</td>`;
+    }}).join('');
+    return `<tr><td style="${{TDL}}">${{c.label}}</td>${{cells}}</tr>`;
+  }}).join('');
+
+  document.getElementById('stress-hist-table').innerHTML =
+    `<table style="width:100%;border-collapse:collapse;"><thead>${{hdr}}</thead><tbody>${{rows}}</tbody></table>`;
+}}
+
+function buildShockImpact(sp500Pct, rateBp, usdPct, oilPct) {{
+  if (!_lastWeights) return null;
+  const totalW = Object.values(_lastWeights).reduce((a, b) => a + b, 0);
+  function calcImpact(w) {{
+    let impact = 0;
+    for (const [etf, wt] of Object.entries(w)) {{
+      const sens = ETF_SENS[etf];
+      if (!sens) continue;
+      const norm = wt / totalW;
+      impact += norm * (
+        sens.sp   * sp500Pct / 100 +
+        sens.rate * rateBp   / 100 +
+        sens.usd  * usdPct   / 10  +
+        sens.oil  * oilPct   / 10
+      );
+    }}
+    return (impact * 100).toFixed(2);
+  }}
+  return {{
+    port: calcImpact(_lastWeights),
+    spy:  calcImpact({{SPY:1}}),
+    bm:   calcImpact({{SPY:0.6, AGG:0.4}}),
+  }};
+}}
+
+function updateShock() {{
+  const sp500 = parseFloat(document.getElementById('shock-sp500')?.value || 0);
+  const rate  = parseFloat(document.getElementById('shock-rate')?.value  || 0);
+  const usd   = parseFloat(document.getElementById('shock-usd')?.value   || 0);
+  const oil   = parseFloat(document.getElementById('shock-oil')?.value   || 0);
+  const sp500V = document.getElementById('shock-sp500-val');
+  const rateV  = document.getElementById('shock-rate-val');
+  const usdV   = document.getElementById('shock-usd-val');
+  const oilV   = document.getElementById('shock-oil-val');
+  if (sp500V) sp500V.textContent = (sp500>=0?'+':'')+sp500+'%';
+  if (rateV)  rateV.textContent  = (rate>=0?'+':'')+rate+'bp';
+  if (usdV)   usdV.textContent   = (usd>=0?'+':'')+usd+'%';
+  if (oilV)   oilV.textContent   = (oil>=0?'+':'')+oil+'%';
+  const el = document.getElementById('shock-result');
+  if (!el) return;
+  const res = buildShockImpact(sp500, rate, usd, oil);
+  if (!res) {{
+    el.innerHTML = '<span style="color:rgba(255,255,255,0.3);">시뮬레이션 실행 후 확인하세요.</span>';
+    return;
+  }}
+  function fmtImpact(v) {{
+    const n = parseFloat(v);
+    const c = n >= 0 ? '#2ecc71' : '#e74c3c';
+    return `<span style="color:${{c}};font-weight:bold;font-size:22px;">${{n>=0?'+':''}}${{v}}%</span>`;
+  }}
+  el.innerHTML = `
+    <div style="display:flex;gap:20px;flex-wrap:wrap;justify-content:center;">
+      <div style="text-align:center;background:rgba(127,90,240,0.1);border:1px solid rgba(127,90,240,0.3);border-radius:8px;padding:16px 24px;">
+        <div style="font-size:11px;color:rgba(255,255,255,0.5);margin-bottom:6px;">모델 포트폴리오</div>
+        ${{fmtImpact(res.port)}}
+      </div>
+      <div style="text-align:center;background:rgba(46,204,113,0.1);border:1px solid rgba(46,204,113,0.3);border-radius:8px;padding:16px 24px;">
+        <div style="font-size:11px;color:rgba(255,255,255,0.5);margin-bottom:6px;">SPY (S&P500)</div>
+        ${{fmtImpact(res.spy)}}
+      </div>
+      <div style="text-align:center;background:rgba(241,196,15,0.1);border:1px solid rgba(241,196,15,0.3);border-radius:8px;padding:16px 24px;">
+        <div style="font-size:11px;color:rgba(255,255,255,0.5);margin-bottom:6px;">60/40</div>
+        ${{fmtImpact(res.bm)}}
+      </div>
+    </div>
+    <p style="margin-top:10px;font-size:11px;color:rgba(255,255,255,0.3);text-align:center;">
+      ※ 팩터 민감도 기반 추정치. 비선형 효과 미반영.</p>`;
+}}
+
+// 고정 시드 PRNG (mulberry32) — Math.random() 대신 사용해 결과 재현성 보장
+function _seededRng(seed) {{
+  let s = seed >>> 0;
+  return function() {{
+    s = (s + 0x6D2B79F5) >>> 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }};
+}}
+
+function runMonteCarloSim(monthlyRets, nSim, months, seed) {{
+  const n = monthlyRets.length;
+  if (n < 12) return [];
+  const rng = _seededRng(seed ?? 42);
+  const result = [];
+  for (let s = 0; s < nSim; s++) {{
+    let cum = 1.0;
+    const path = [100];
+    for (let m = 0; m < months; m++) {{
+      const r = monthlyRets[Math.floor(rng() * n)];
+      cum *= (1 + r);
+      path.push(cum * 100);
+    }}
+    result.push(path);
+  }}
+  return result;
+}}
+
+function pctile(arr, p) {{
+  const sorted = [...arr].sort((a, b) => a - b);
+  const idx = (p / 100) * (sorted.length - 1);
+  const lo = Math.floor(idx), hi = Math.ceil(idx);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+}}
+
+function renderMonteCarlo() {{
+  if (!_portRet2010 || _portRet2010.length < 12) return;
+  const horizon = parseInt(document.getElementById('mc-horizon')?.value || 60);
+  const nSim = 500;
+  const paths = runMonteCarloSim(_portRet2010, nSim, horizon);
+  if (!paths.length) return;
+
+  const xArr  = Array.from({{length: horizon + 1}}, (_, i) => i);
+  const pcts  = [5, 25, 50, 75, 95];
+  const bands = pcts.map(p => xArr.map((_, i) => pctile(paths.map(path => path[i]), p)));
+
+  const finalVals  = paths.map(p => p[p.length - 1]);
+  const profitSims = finalVals.filter(v => v > 100);
+  const lossSims   = finalVals.filter(v => v <= 100);
+  const profitProb = (profitSims.length / nSim * 100).toFixed(1);
+  const lossProb   = (lossSims.length   / nSim * 100).toFixed(1);
+  const avgProfit  = profitSims.length
+    ? (profitSims.reduce((a, b) => a + b, 0) / profitSims.length - 100).toFixed(1) : null;
+  const avgLoss    = lossSims.length
+    ? (lossSims.reduce((a, b)   => a + b, 0) / lossSims.length   - 100).toFixed(1) : null;
+
+  const traces = [
+    {{x:[...xArr,...[...xArr].reverse()], y:[...bands[4],...[...bands[0]].reverse()],
+      fill:'toself', fillcolor:'rgba(127,90,240,0.12)', line:{{color:'transparent'}},
+      name:'90% 구간', hoverinfo:'skip'}},
+    {{x:[...xArr,...[...xArr].reverse()], y:[...bands[3],...[...bands[1]].reverse()],
+      fill:'toself', fillcolor:'rgba(127,90,240,0.25)', line:{{color:'transparent'}},
+      name:'50% 구간', hoverinfo:'skip'}},
+    {{x:xArr, y:bands[2], name:'중앙값 (50th)',
+      line:{{color:'#7f5af0',width:2.5}},
+      hovertemplate:'%{{x}}개월: %{{y:.1f}}<extra>중앙값</extra>'}},
+    {{x:xArr, y:bands[4], name:'95th percentile',
+      line:{{color:'rgba(127,90,240,0.5)',width:1,dash:'dot'}}, hoverinfo:'skip'}},
+    {{x:xArr, y:bands[0], name:'5th percentile',
+      line:{{color:'rgba(127,90,240,0.5)',width:1,dash:'dot'}}, hoverinfo:'skip'}},
+    {{x:[0,horizon], y:[100,100], name:'시작점 (100)',
+      line:{{color:'rgba(255,255,255,0.2)',width:1,dash:'dash'}}, hoverinfo:'skip'}},
+  ];
+
+  Plotly.newPlot('stress-mc-chart', traces, {{
+    template:'plotly_dark', paper_bgcolor:'#111', plot_bgcolor:'#111',
+    height:320, margin:{{l:55,r:20,t:40,b:50}},
+    title:{{text:`몬테카를로 시뮬레이션 (${{nSim}}회, ${{horizon}}개월)`, font:{{size:13}}}},
+    xaxis:{{title:'개월', showgrid:true, gridcolor:'#1e2d3d'}},
+    yaxis:{{title:'누적 수익률 (시작=100)', showgrid:true, gridcolor:'#1e2d3d'}},
+    legend:{{orientation:'h',y:1.12,x:0.5,xanchor:'center'}},
+    font:{{family:'Malgun Gothic',size:11,color:'rgba(255,255,255,0.9)'}},
+    dragmode:false,
+  }}, {{responsive:true, scrollZoom:false, displayModeBar:false}});
+
+  document.getElementById('mc-stats').innerHTML = `
+    <div style="display:flex;gap:16px;flex-wrap:wrap;justify-content:center;margin-top:16px;">
+      <div style="text-align:center;background:rgba(46,204,113,0.1);border:1px solid rgba(46,204,113,0.3);border-radius:8px;padding:14px 20px;">
+        <div style="font-size:11px;color:rgba(255,255,255,0.45);margin-bottom:4px;">수익 확률</div>
+        <div style="font-size:22px;font-weight:bold;color:#2ecc71;">${{profitProb}}%</div>
+      </div>
+      <div style="text-align:center;background:rgba(231,76,60,0.1);border:1px solid rgba(231,76,60,0.3);border-radius:8px;padding:14px 20px;">
+        <div style="font-size:11px;color:rgba(255,255,255,0.45);margin-bottom:4px;">손실 확률</div>
+        <div style="font-size:22px;font-weight:bold;color:#e74c3c;">${{lossProb}}%</div>
+      </div>
+      <div style="text-align:center;background:rgba(46,204,113,0.08);border:1px solid rgba(46,204,113,0.2);border-radius:8px;padding:14px 20px;">
+        <div style="font-size:11px;color:rgba(255,255,255,0.45);margin-bottom:4px;">수익시 평균 수익률</div>
+        <div style="font-size:22px;font-weight:bold;color:#2ecc71;">${{avgProfit!==null?(parseFloat(avgProfit)>=0?'+':'')+avgProfit:'N/A'}}%</div>
+      </div>
+      <div style="text-align:center;background:rgba(231,76,60,0.08);border:1px solid rgba(231,76,60,0.2);border-radius:8px;padding:14px 20px;">
+        <div style="font-size:11px;color:rgba(255,255,255,0.45);margin-bottom:4px;">손실시 평균 손실률</div>
+        <div style="font-size:22px;font-weight:bold;color:#e74c3c;">${{avgLoss!==null?avgLoss:'N/A'}}%</div>
+      </div>
+    </div>
+    <p style="margin-top:10px;font-size:11px;color:rgba(255,255,255,0.3);text-align:center;">
+      ※ 2010년 이후 월별 수익률 부트스트랩 샘플링. 미래 수익률 보장 아님.</p>`;
+}}
+
+// ══════════════════════════════════════════════
+// 개선 포트폴리오 (효율적 투자기회선)
+// ══════════════════════════════════════════════
+
+// 랜덤 Dirichlet 비중 (균등 심플렉스 샘플링)
+function _randDirichlet(etfs, rng) {{
+  const vals = etfs.map(() => -Math.log(rng() + 1e-10));
+  const sum  = vals.reduce((a, b) => a + b, 0);
+  const w = {{}};
+  etfs.forEach((t, i) => {{ w[t] = vals[i] / sum; }});
+  return w;
+}}
+
+// 단순 포트폴리오 통계 (가중합 수익률 기반, Rf=0)
+function _simPortStats(normW, etfRets, n) {{
+  const etfs = Object.keys(normW);
+  const portRet = [];
+  for (let i = 0; i < n; i++) {{
+    let r = 0;
+    for (const t of etfs) {{
+      const v = etfRets[t]?.[i];
+      if (v !== null && v !== undefined && !isNaN(v)) r += normW[t] * v;
+    }}
+    portRet.push(r);
+  }}
+  const mean  = portRet.reduce((a, b) => a + b, 0) / n;
+  const std   = Math.sqrt(portRet.map(x => (x - mean) ** 2).reduce((a, b) => a + b, 0) / (n - 1));
+  const mu    = mean * 12 * 100;
+  const sigma = std * Math.sqrt(12) * 100;
+  const sharpe = sigma > 0 ? mu / sigma : 0;
+  return {{mu, sigma, sharpe}};
+}}
+
+function showImproved() {{
+  if (!_lastWeights) {{ alert('먼저 시뮬레이션을 실행하세요.'); return; }}
+  const el  = document.getElementById('improved-result');
+  const btn = document.getElementById('improve-btn');
+  el.innerHTML = '<div style="text-align:center;padding:30px;color:rgba(255,255,255,0.5);">⏳ Monte Carlo 계산 중... (4,000회)</div>';
+  if (btn) {{ btn.disabled = true; btn.textContent = '⏳ 계산 중...'; }}
+  setTimeout(() => {{
+    try {{
+      _doImprovedAnalysis(el);
+    }} catch(e) {{
+      el.innerHTML = `<div style="color:#e74c3c;text-align:center;padding:20px;">오류: ${{e.message}}</div>`;
+    }}
+    if (btn) {{ btn.disabled = false; btn.textContent = '🔍 개선 포트폴리오 분석'; }}
+  }}, 60);
+}}
+
+function _doImprovedAnalysis(el) {{
+  // 1. 2010년 이후 ETF 수익률 배열 추출
+  const dates  = MONTHLY_DATA.dates;
+  const si     = dates.findIndex(d => d >= '2010-01-01');
+  const slice  = si >= 0 ? si : 0;
+  const retData = MONTHLY_DATA.returns;
+  const n      = dates.length - slice;
+  const etfRets = {{}};
+  for (const [t, arr] of Object.entries(retData)) etfRets[t] = arr.slice(slice);
+
+  // 2. 현재 ETF 목록 및 정규화 비중
+  const currEtfs  = Object.keys(_lastWeights).filter(t => t in etfRets);
+  const currTotal = currEtfs.reduce((s, t) => s + _lastWeights[t], 0);
+  if (!currEtfs.length || currTotal <= 0) {{
+    el.innerHTML = '<div style="color:#e74c3c;text-align:center;padding:20px;">현재 포트폴리오 데이터 없음</div>';
+    return;
+  }}
+  const currNorm = {{}};
+  for (const t of currEtfs) currNorm[t] = _lastWeights[t] / currTotal;
+
+  // 3. 현재 포트폴리오 통계
+  const curr = _simPortStats(currNorm, etfRets, n);
+
+  // 4. Monte Carlo: 4,000개 랜덤 비중 조합
+  const N_SIM = 4000;
+  const rng = _seededRng(1234);
+  const sim = [];
+  for (let s = 0; s < N_SIM; s++) {{
+    const w     = _randDirichlet(currEtfs, rng);
+    const stats = _simPortStats(w, etfRets, n);
+    if (stats) sim.push({{...stats, w}});
+  }}
+
+  // 5. 극단값 제거 (sigma 2~98 percentile, mu 1~99 percentile)
+  const _sortedSig = sim.map(p => p.sigma).sort((a, b) => a - b);
+  const _sortedMu  = sim.map(p => p.mu).sort((a, b) => a - b);
+  const _p2  = _sortedSig[Math.floor(sim.length * 0.02)];
+  const _p98 = _sortedSig[Math.floor(sim.length * 0.98)];
+  const _m1  = _sortedMu[Math.floor(sim.length * 0.01)];
+  const _m99 = _sortedMu[Math.floor(sim.length * 0.99)];
+  const simVis = sim.filter(p => p.sigma >= _p2 && p.sigma <= _p98 && p.mu >= _m1 && p.mu <= _m99);
+
+  // 효율적 프론티어 (필터된 범위에서 sigma 구간별 최고 mu)
+  const sigMin  = _p2;
+  const sigMax  = _p98;
+  const bins    = 40;
+  const step    = (sigMax - sigMin) / bins;
+  const frontier = [];
+  for (let i = 0; i < bins; i++) {{
+    const lo = sigMin + i * step, hi = lo + step;
+    const inBin = simVis.filter(p => p.sigma >= lo && p.sigma < hi);
+    if (inBin.length) frontier.push(inBin.reduce((a, b) => a.mu > b.mu ? a : b));
+  }}
+  frontier.sort((a, b) => a.sigma - b.sigma);
+
+  // 6. 개선 포트폴리오 탐색 — 반드시 효율적 투자기회선(frontier) 위의 점만 선택
+  // ① 수익률 유지·변동성↓ — frontier 중 sigma < curr.sigma이고 mu가 curr.mu에 가장 근접한 점 (수평 좌이동)
+  const cand1 = frontier
+    .filter(p => p.sigma < curr.sigma - 0.05)
+    .sort((a, b) => Math.abs(a.mu - curr.mu) - Math.abs(b.mu - curr.mu));
+  const imp1 = cand1[0] || null;
+
+  // ② 변동성 유지·수익률↑ — frontier 중 mu > curr.mu이고 sigma가 curr.sigma에 가장 근접한 점 (수직 상향)
+  const cand2 = frontier
+    .filter(p => p.mu > curr.mu + 0.05)
+    .sort((a, b) => Math.abs(a.sigma - curr.sigma) - Math.abs(b.sigma - curr.sigma));
+  const imp2 = cand2[0] || null;
+
+  // 7. 렌더링
+  el.innerHTML = `
+    <div id="frontier-chart" style="margin-bottom:20px;"></div>
+    <div id="frontier-table"></div>
+    <div id="imp-pie-charts" style="display:flex;gap:12px;margin-top:20px;"></div>`;
+
+  // ─ 차트 traces
+  const colorVals = simVis.map(p => parseFloat(p.sharpe.toFixed(3)));
+  const traces = [
+    {{
+      type:'scatter', mode:'markers', name:'시뮬레이션 포트폴리오',
+      x: simVis.map(p => parseFloat(p.sigma.toFixed(3))),
+      y: simVis.map(p => parseFloat(p.mu.toFixed(3))),
+      marker: {{size:3, color:colorVals, colorscale:'Plasma', opacity:0.45,
+               showscale:true,
+               colorbar:{{title:{{text:'샤프', font:{{size:10}}}}, thickness:12, len:0.6,
+                          tickfont:{{size:9, color:'rgba(255,255,255,0.7)'}}}}}},
+      hoverinfo:'skip',
+    }},
+    {{
+      type:'scatter', mode:'lines+markers', name:'효율적 투자기회선',
+      x: frontier.map(p => parseFloat(p.sigma.toFixed(3))),
+      y: frontier.map(p => parseFloat(p.mu.toFixed(3))),
+      line:{{color:'#f1c40f', width:2.5}},
+      marker:{{size:5, color:'#f1c40f'}},
+      hovertemplate:'σ: %{{x:.2f}}%<br>μ: %{{y:.2f}}%<extra>효율적 프론티어</extra>',
+    }},
+    {{
+      type:'scatter', mode:'markers+text', name:'현재 포트폴리오',
+      x:[parseFloat(curr.sigma.toFixed(3))], y:[parseFloat(curr.mu.toFixed(3))],
+      marker:{{size:16, color:'#e74c3c', symbol:'star', line:{{color:'white',width:1}}}},
+      text:['현재'], textposition:'top center',
+      textfont:{{color:'#e74c3c', size:11, family:'Malgun Gothic'}},
+      hovertemplate:`σ: ${{curr.sigma.toFixed(2)}}%<br>μ: ${{curr.mu.toFixed(2)}}%<br>샤프: ${{curr.sharpe.toFixed(2)}}<extra>현재</extra>`,
+    }},
+  ];
+
+  const annotations = [];
+  if (imp1) {{
+    traces.push({{
+      type:'scatter', mode:'markers+text', name:'① 수익률 유지·변동성↓',
+      x:[parseFloat(imp1.sigma.toFixed(3))], y:[parseFloat(imp1.mu.toFixed(3))],
+      marker:{{size:14, color:'#2ecc71', symbol:'triangle-up', line:{{color:'white',width:1}}}},
+      text:['① 개선'], textposition:'top center',
+      textfont:{{color:'#2ecc71', size:11, family:'Malgun Gothic'}},
+      hovertemplate:`σ: ${{imp1.sigma.toFixed(2)}}%<br>μ: ${{imp1.mu.toFixed(2)}}%<br>샤프: ${{imp1.sharpe.toFixed(2)}}<extra>①개선</extra>`,
+    }});
+    annotations.push({{
+      ax:parseFloat(curr.sigma.toFixed(3)), ay:parseFloat(curr.mu.toFixed(3)),
+      x:parseFloat(imp1.sigma.toFixed(3)),  y:parseFloat(imp1.mu.toFixed(3)),
+      axref:'x', ayref:'y', xref:'x', yref:'y',
+      showarrow:true, arrowhead:3, arrowcolor:'#2ecc71', arrowwidth:2.5, arrowsize:1.3,
+      text:'', standoff:10,
+    }});
+  }}
+  if (imp2) {{
+    traces.push({{
+      type:'scatter', mode:'markers+text', name:'② 변동성 유지·수익률↑',
+      x:[parseFloat(imp2.sigma.toFixed(3))], y:[parseFloat(imp2.mu.toFixed(3))],
+      marker:{{size:14, color:'#3498db', symbol:'square', line:{{color:'white',width:1}}}},
+      text:['② 개선'], textposition:'top center',
+      textfont:{{color:'#3498db', size:11, family:'Malgun Gothic'}},
+      hovertemplate:`σ: ${{imp2.sigma.toFixed(2)}}%<br>μ: ${{imp2.mu.toFixed(2)}}%<br>샤프: ${{imp2.sharpe.toFixed(2)}}<extra>②개선</extra>`,
+    }});
+    annotations.push({{
+      ax:parseFloat(curr.sigma.toFixed(3)), ay:parseFloat(curr.mu.toFixed(3)),
+      x:parseFloat(imp2.sigma.toFixed(3)),  y:parseFloat(imp2.mu.toFixed(3)),
+      axref:'x', ayref:'y', xref:'x', yref:'y',
+      showarrow:true, arrowhead:3, arrowcolor:'#3498db', arrowwidth:2.5, arrowsize:1.3,
+      text:'', standoff:10,
+    }});
+  }}
+
+  Plotly.newPlot('frontier-chart', traces, {{
+    template:'plotly_dark', paper_bgcolor:'#111', plot_bgcolor:'#111',
+    height:540, margin:{{l:65,r:30,t:60,b:110}},
+    title:{{text:'효율적 투자기회선 — 현재 포트폴리오 vs 개선안',
+            font:{{size:14, color:'rgba(255,255,255,0.9)'}},
+            y:0.97, x:0.5, xanchor:'center', yanchor:'top'}},
+    xaxis:{{title:{{text:'연 변동성 (σ, %)', font:{{color:'rgba(255,255,255,0.9)'}}}},
+            showgrid:true, gridcolor:'#1e2d3d',
+            tickfont:{{color:'rgba(255,255,255,0.9)'}}}},
+    yaxis:{{title:{{text:'연 기대수익률 (μ, %)', font:{{color:'rgba(255,255,255,0.9)'}}}},
+            showgrid:true, gridcolor:'#1e2d3d',
+            tickfont:{{color:'rgba(255,255,255,0.9)'}}}},
+    legend:{{orientation:'h', y:-0.22, x:0.5, xanchor:'center', yanchor:'top',
+             font:{{color:'rgba(255,255,255,0.9)', size:11}}}},
+    font:{{family:'Malgun Gothic', size:11, color:'rgba(255,255,255,0.9)'}},
+    annotations,
+    dragmode:'pan',
+  }}, {{responsive:true, scrollZoom:true, displayModeBar:false}});
+
+  // ── 클릭 시 십자선 토글 ──────────────────────
+  (function() {{
+    const cid = 'frontier-chart';
+    let _crossX = null, _crossY = null;
+    document.getElementById(cid).on('plotly_click', function(data) {{
+      const pt = data.points[0];
+      const x  = pt.x, y = pt.y;
+      if (_crossX === x && _crossY === y) {{
+        // 같은 점 재클릭 → 비활성화
+        _crossX = null; _crossY = null;
+        Plotly.relayout(cid, {{shapes: []}});
+      }} else {{
+        _crossX = x; _crossY = y;
+        Plotly.relayout(cid, {{
+          shapes: [
+            {{ type:'line', xref:'x', yref:'paper',
+               x0:x, x1:x, y0:0, y1:1,
+               line:{{color:'rgba(255,255,255,0.55)', width:1.5, dash:'dot'}} }},
+            {{ type:'line', xref:'paper', yref:'y',
+               x0:0, x1:1, y0:y, y1:y,
+               line:{{color:'rgba(255,255,255,0.55)', width:1.5, dash:'dot'}} }},
+          ]
+        }});
+      }}
+    }});
+    // 차트 외부 클릭 or 더블클릭 → 초기화
+    document.getElementById(cid).on('plotly_doubleclick', function() {{
+      _crossX = null; _crossY = null;
+      Plotly.relayout(cid, {{shapes: []}});
+    }});
+  }})();
+
+  // ─ 비중 비교 테이블
+  const TH  = 'padding:7px 10px;font-size:11px;border-bottom:2px solid #2c3e50;color:white;font-weight:bold;text-align:right;white-space:nowrap;';
+  const THL = 'padding:7px 10px;font-size:11px;border-bottom:2px solid #2c3e50;color:white;font-weight:bold;text-align:left;';
+  const TD  = 'padding:6px 10px;font-size:11px;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;color:white;';
+  const TDL = 'padding:6px 10px;font-size:11px;border-bottom:1px solid rgba(255,255,255,0.06);text-align:left;color:white;';
+
+  function fmtDiff(v) {{
+    if (v === null) return '-';
+    const c = v > 0.05 ? '#2ecc71' : v < -0.05 ? '#e74c3c' : '#aaa';
+    return `<span style="color:${{c}};">${{v > 0 ? '+' : ''}}${{v.toFixed(1)}}%p</span>`;
+  }}
+
+  const rows = currEtfs.map(t => {{
+    const cW  = (currNorm[t] * 100).toFixed(1);
+    const i1W = imp1 ? (imp1.w[t] * 100).toFixed(1) : '-';
+    const i2W = imp2 ? (imp2.w[t] * 100).toFixed(1) : '-';
+    const d1  = imp1 ? (imp1.w[t] - currNorm[t]) * 100 : null;
+    const d2  = imp2 ? (imp2.w[t] - currNorm[t]) * 100 : null;
+    const etfDesc = ETF_INFO[t] ? ETF_INFO[t].desc : '';
+    return `<tr>
+      <td style="${{TDL}}">${{t}}<span style="color:rgba(255,255,255,0.4);font-size:10px;margin-left:5px;">${{etfDesc}}</span></td>
+      <td style="${{TD}}">${{cW}}%</td>
+      <td style="${{TD}}">${{i1W !== '-' ? i1W + '%' : '-'}}</td>
+      <td style="${{TD}}">${{fmtDiff(d1)}}</td>
+      <td style="${{TD}}">${{i2W !== '-' ? i2W + '%' : '-'}}</td>
+      <td style="${{TD}}">${{fmtDiff(d2)}}</td>
+    </tr>`;
+  }}).join('');
+
+  function summaryRow(label, color, s) {{
+    if (!s) return '';
+    return `<tr style="background:rgba(255,255,255,0.04);">
+      <td style="${{TDL}}color:${{color}};font-weight:bold;">${{label}}</td>
+      <td style="${{TD}}color:rgba(255,255,255,0.4);" colspan="2">σ ${{s.sigma.toFixed(2)}}% &nbsp; μ ${{s.mu.toFixed(2)}}%</td>
+      <td style="${{TD}}color:rgba(255,255,255,0.4);" colspan="3">샤프: <b style="color:white;">${{s.sharpe.toFixed(3)}}</b></td>
+    </tr>`;
+  }}
+
+  document.getElementById('frontier-table').innerHTML = `
+    <table style="width:100%;border-collapse:collapse;margin-top:8px;">
+      <thead>
+        <tr>
+          <th style="${{THL}}">ETF</th>
+          <th style="${{TH}}">현재 비중</th>
+          <th style="${{TH}}">① 샤프 고정<br>변동성↓</th>
+          <th style="${{TH}}">① 변화</th>
+          <th style="${{TH}}">② 샤프 고정<br>수익률↑</th>
+          <th style="${{TH}}">② 변화</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${{rows}}
+        ${{summaryRow('현재', '#e74c3c', curr)}}
+        ${{summaryRow('① 수익률 유지·변동성↓', '#2ecc71', imp1)}}
+        ${{summaryRow('② 변동성 유지·수익률↑', '#3498db', imp2)}}
+      </tbody>
+    </table>
+    ${{!imp1 && !imp2 ? '<p style="text-align:center;color:rgba(255,255,255,0.4);font-size:12px;margin-top:12px;">※ 현재 포트폴리오가 이미 효율적 프론티어에 근접해 있어 유의미한 개선안을 찾지 못했습니다.</p>' : ''}}`;
+
+  // ── 파이차트 3개 ─────────────────────────────────
+  (function renderImpPies() {{
+    const pieContainer = document.getElementById('imp-pie-charts');
+    if (!pieContainer) return;
+
+    const styleOrder = {json.dumps(OPTIMAL_STYLES, ensure_ascii=False)};
+    const pieDefs = [
+      {{ label: '현재 포트폴리오', w: currNorm,               color: '#e74c3c' }},
+      {{ label: '개선안 ① 변동성↓', w: imp1 ? imp1.w : null, color: '#2ecc71' }},
+      {{ label: '개선안 ② 수익률↑', w: imp2 ? imp2.w : null, color: '#3498db' }},
+    ];
+
+    // 공통 범례 HTML (스타일별 색상 한 번만 표시)
+    const legendHtml = styleOrder.map(s => {{
+      const c = STYLE_COLORS[s] || '#aaa';
+      return `<span style="display:inline-flex;align-items:center;gap:4px;font-size:11px;color:rgba(255,255,255,0.7);">
+        <span style="width:10px;height:10px;border-radius:2px;background:${{c}};flex-shrink:0;"></span>${{s}}</span>`;
+    }}).join('');
+
+    // 차트 행 + 범례 래퍼
+    pieContainer.innerHTML = `
+      <div style="width:100%;">
+        <div id="imp-pie-row" style="display:flex;gap:12px;"></div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px 14px;justify-content:center;margin-top:10px;">
+          ${{legendHtml}}
+        </div>
+      </div>`;
+
+    const row = document.getElementById('imp-pie-row');
+
+    // 차트 DOM 먼저 생성 후 Plotly는 setTimeout으로 렌더 (layout 안정화)
+    const renderJobs = [];
+    pieDefs.forEach((def, idx) => {{
+      const pid = 'imp-pie-' + idx;
+      const wrapper = document.createElement('div');
+      wrapper.style.cssText = 'flex:1;min-width:0;background:rgba(255,255,255,0.03);border-radius:10px;padding:12px 8px;text-align:center;overflow:visible;';
+      wrapper.innerHTML = `
+        <div style="font-size:12px;color:${{def.color}};font-weight:bold;margin-bottom:4px;">${{def.label}}</div>
+        <div id="${{pid}}" style="height:300px;overflow:visible;"></div>`;
+      row.appendChild(wrapper);
+
+      if (!def.w) {{
+        document.getElementById(pid).innerHTML =
+          '<div style="color:rgba(255,255,255,0.25);padding-top:80px;font-size:12px;">데이터 없음</div>';
+        return;
+      }}
+
+      // ETF → 스타일 그룹 집계
+      const styleAgg = {{}};
+      for (const [t, w] of Object.entries(def.w)) {{
+        const st = ETF_STYLE_MAP[t] || '기타';
+        styleAgg[st] = (styleAgg[st] || 0) + w;
+      }}
+      const labels = [], vals = [], colors = [];
+      styleOrder.forEach(s => {{
+        if ((styleAgg[s] || 0) > 0.001) {{
+          labels.push(s);
+          vals.push(parseFloat((styleAgg[s] * 100).toFixed(1)));
+          colors.push(STYLE_COLORS[s] || '#aaa');
+        }}
+      }});
+      for (const [s, v] of Object.entries(styleAgg)) {{
+        if (!styleOrder.includes(s) && v > 0.001) {{
+          labels.push(s); vals.push(parseFloat((v * 100).toFixed(1))); colors.push('#aaa');
+        }}
+      }}
+
+      renderJobs.push({{ pid, labels, vals, colors }});
+    }});
+
+    // DOM 배치 완료 후 Plotly 렌더
+    setTimeout(() => {{
+      renderJobs.forEach(job => {{
+        Plotly.newPlot(job.pid, [{{
+          type: 'pie',
+          labels: job.labels,
+          values: job.vals,
+          marker: {{ colors: job.colors }},
+          textinfo: 'label+percent',
+          textposition: 'auto',
+          textfont: {{ size: 11, color: 'white' }},
+          outsidetextfont: {{ size: 11, color: 'rgba(255,255,255,0.85)' }},
+          hovertemplate: '%{{label}}: %{{value:.1f}}%<extra></extra>',
+          hole: 0.38,
+        }}], {{
+          paper_bgcolor: 'transparent',
+          plot_bgcolor: 'transparent',
+          margin: {{ t: 30, b: 55, l: 55, r: 55 }},
+          showlegend: false,
+        }}, {{ responsive: true, displayModeBar: false }});
+      }});
+    }}, 80);
+  }})();
+
+  // ── 전역 저장 → 개선안 탭 백테스트 렌더
+  _globalImp1     = imp1;
+  _globalImp2     = imp2;
+  _globalCurrNorm = currNorm;
+  _renderImpBacktest();
+  // 개선안 탭으로 자동 이동
+  const impTabBtn = document.getElementById('improve-tab-btn');
+  if (impTabBtn) showTab('improvement', impTabBtn);
+}}
+
+// ── 개선안 백테스트 비교 렌더 ───────────────────
+function _renderImpBacktest() {{
+  const sec = document.getElementById('imp-backtest-section');
+  if (!sec) return;
+  if (!_globalImp1 && !_globalImp2) {{ sec.style.display = 'none'; return; }}
+
+  const allDates = MONTHLY_DATA.dates;
+  const si       = allDates.findIndex(d => d >= '2010-01-01');
+  const sIdx     = si >= 0 ? si : 0;
+
+  // ── 월별 수익률 → 누적지수 계산 ─────────────
+  function toCum(monthlyRets) {{
+    let v = 100; return monthlyRets.map(r => {{ v *= (1 + r); return v; }});
+  }}
+
+  const portCurr = computePortfolioReturnsQR(_lastWeights);
+  const cumCurr  = toCum(portCurr.returns);
+
+  let imp1Rets = null, cumImp1 = null;
+  let imp2Rets = null, cumImp2 = null;
+  if (_globalImp1) {{
+    imp1Rets = computePortfolioReturnsQR(_globalImp1.w);
+    cumImp1  = toCum(imp1Rets.returns);
+  }}
+  if (_globalImp2) {{
+    imp2Rets = computePortfolioReturnsQR(_globalImp2.w);
+    cumImp2  = toCum(imp2Rets.returns);
+  }}
+
+  const dates  = allDates.slice(sIdx);
+  const base0  = v => v.slice(sIdx).map(x => x / v[sIdx] * 100);
+  const pCurr  = base0(cumCurr);
+  const pImp1  = cumImp1 ? base0(cumImp1) : null;
+  const pImp2  = cumImp2 ? base0(cumImp2) : null;
+
+  // ── 기간 수익률 계산 ─────────────────────────
+  function periodRet(cum, dts, months) {{
+    const n = cum.length - 1;
+    const tgt = new Date(dts[n]); tgt.setMonth(tgt.getMonth() - months);
+    const ts  = tgt.toISOString().substring(0, 7);
+    let idx = -1;
+    for (let i = n; i >= 0; i--) {{ if (dts[i] <= ts) {{ idx = i; break; }} }}
+    if (idx < 0 || idx >= n) return null;
+    return (cum[n] / cum[idx] - 1) * 100;
+  }}
+  const PERIODS = [['1M',1],['3M',3],['6M',6],['1Y',12],['3Y',36],['5Y',60],['10Y',120]];
+
+  // ── 성과 지표 계산 ────────────────────────────
+  function perfMetrics(rets, cumArr) {{
+    const n = rets.length;
+    if (n < 12) return null;
+    const annRet = (Math.pow(cumArr[n-1]/cumArr[0], 12/n) - 1) * 100;
+    const mean   = rets.reduce((a,b)=>a+b,0)/n;
+    const vol    = Math.sqrt(rets.reduce((a,b)=>a+(b-mean)**2,0)/(n-1)*12)*100;
+    const sharpe = vol > 0 ? annRet/vol : 0;
+    let peak = cumArr[0], mdd = 0;
+    for (const v of cumArr) {{
+      if (v > peak) peak = v;
+      const dd = (v-peak)/peak*100;
+      if (dd < mdd) mdd = dd;
+    }}
+    return {{ annRet, vol, sharpe, mdd }};
+  }}
+
+  const mCurr = perfMetrics(portCurr.returns.slice(sIdx), pCurr);
+  const mImp1 = imp1Rets ? perfMetrics(imp1Rets.returns.slice(sIdx), pImp1) : null;
+  const mImp2 = imp2Rets ? perfMetrics(imp2Rets.returns.slice(sIdx), pImp2) : null;
+
+  // ── 누적 수익률 차트 ──────────────────────────
+  const traces = [{{
+    x: dates, y: pCurr, name: '현재 포트',
+    line: {{color:'#e74c3c', width:2}}, mode:'lines'
+  }}];
+  if (pImp1) traces.push({{ x:dates, y:pImp1, name:'① 수익률 유지·변동성↓', line:{{color:'#2ecc71',width:2,dash:'dot'}}, mode:'lines' }});
+  if (pImp2) traces.push({{ x:dates, y:pImp2, name:'② 변동성 유지·수익률↑', line:{{color:'#3498db',width:2,dash:'dot'}}, mode:'lines' }});
+
+  const cumId = 'imp-cum-chart';
+  sec.style.display = 'block';
+  sec.innerHTML = `
+<div class="content">
+  <div class="section">
+    <h2 class="section-title">📊 개선안 백테스트 비교 <span style="font-size:12px;color:rgba(255,255,255,0.4);font-weight:normal;">2010~ 기준 100 시작 · 분기 리밸런싱</span></h2>
+
+    <div id="${{cumId}}" style="width:100%;height:320px;"></div>
+
+    <!-- 기간 수익률 + 성과 지표 표 -->
+    <div style="overflow-x:auto;margin-top:20px;">
+    <table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <thead>
+        <tr>
+          <th style="padding:8px 12px;border-bottom:2px solid #2c3e50;text-align:left;color:rgba(255,255,255,0.6);">구분</th>
+          ${{PERIODS.map(([l])=>`<th style="padding:8px 10px;border-bottom:2px solid #2c3e50;text-align:right;color:rgba(255,255,255,0.6);">${{l}}</th>`).join('')}}
+          <th style="padding:8px 12px;border-bottom:2px solid #2c3e50;text-align:right;color:rgba(255,255,255,0.6);background:rgba(255,255,255,0.04);">연환산수익률</th>
+          <th style="padding:8px 12px;border-bottom:2px solid #2c3e50;text-align:right;color:rgba(255,255,255,0.6);background:rgba(255,255,255,0.04);">연환산변동성</th>
+          <th style="padding:8px 12px;border-bottom:2px solid #2c3e50;text-align:right;color:rgba(255,255,255,0.6);background:rgba(255,255,255,0.04);">샤프</th>
+          <th style="padding:8px 12px;border-bottom:2px solid #2c3e50;text-align:right;color:rgba(255,255,255,0.6);background:rgba(255,255,255,0.04);">MDD</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${{[
+          ['현재 포트', '#e74c3c', pCurr, portCurr.returns.slice(sIdx), mCurr],
+          pImp1 ? ['개선안 1 (변동성↓)', '#2ecc71', pImp1, imp1Rets.returns.slice(sIdx), mImp1] : null,
+          pImp2 ? ['개선안 2 (수익률↑)', '#3498db', pImp2, imp2Rets.returns.slice(sIdx), mImp2] : null,
+        ].filter(Boolean).map(([label, color, cum, rets, m]) => {{
+          const pCells = PERIODS.map(([,mo]) => {{
+            const v = periodRet(cum, dates, mo);
+            if (v===null) return `<td style="padding:7px 10px;text-align:right;color:#555;border-bottom:1px solid rgba(255,255,255,0.06);">-</td>`;
+            const c = v>=0?'#2ecc71':'#e74c3c';
+            return `<td style="padding:7px 10px;text-align:right;color:${{c}};font-weight:bold;border-bottom:1px solid rgba(255,255,255,0.06);">${{v>=0?'+':''}}${{v.toFixed(1)}}%</td>`;
+          }}).join('');
+          const mCells = m ? [
+            `${{m.annRet.toFixed(1)}}%`,`${{m.vol.toFixed(1)}}%`,`${{m.sharpe.toFixed(2)}}`,`${{m.mdd.toFixed(1)}}%`
+          ].map(v=>`<td style="padding:7px 12px;text-align:right;color:white;font-weight:bold;border-bottom:1px solid rgba(255,255,255,0.06);background:rgba(255,255,255,0.04);">${{v}}</td>`).join('')
+          : '<td colspan="4" style="text-align:center;color:#555;">-</td>';
+          return `<tr>
+            <td style="padding:7px 12px;font-weight:bold;color:${{color}};border-bottom:1px solid rgba(255,255,255,0.06);">${{label}}</td>
+            ${{pCells}}${{mCells}}
+          </tr>`;
+        }}).join('')}}
+      </tbody>
+    </table>
+    </div>
+
+    <!-- 개선 효과 비교 카드 -->
+    ${{(mImp1 || mImp2) ? `
+    <div style="margin-top:28px;">
+      <div style="font-size:13px;color:rgba(255,255,255,0.5);margin-bottom:12px;">📈 현재 포트 대비 개선 효과</div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;">
+        ${{[
+          ['연환산 수익률', 'annRet', '%', false],
+          ['연환산 변동성', 'vol',    '%', true],
+          ['샤프 비율',    'sharpe', '',  false],
+          ['MDD',         'mdd',    '%', false],  // MDD: 값이 0에 가까울수록(덜 음수) 개선
+        ].map(([title, key, unit, lowerBetter]) => {{
+          function deltaBar(imp, mC, label) {{
+            if (!imp || !mC) return '';
+            const delta = imp[key] - mC[key];
+            // MDD는 음수 값이므로 delta > 0 이면 덜 음수(개선), delta < 0 이면 더 음수(악화)
+            // 일반 지표: lowerBetter=true → delta<0 이 개선
+            const good  = lowerBetter ? delta < 0 : delta > 0;
+            const pct   = mC[key] !== 0 ? Math.abs(delta/mC[key]*100) : 0;
+            const color = good ? '#2ecc71' : '#e74c3c';
+            const sign  = delta > 0 ? '+' : '';
+            const barW  = Math.min(pct * 2, 100);
+            return `
+              <div style="margin-top:6px;font-size:11px;color:rgba(255,255,255,0.5);">
+                ${{label}} ${{sign}}${{delta.toFixed(2)}}${{unit}}
+                <span style="color:${{color}};margin-left:4px;">(${{good?'▲개선':'▼악화'}})</span>
+              </div>
+              <div style="background:rgba(255,255,255,0.08);border-radius:3px;height:5px;margin-top:3px;">
+                <div style="width:${{barW}}%;height:100%;background:${{color}};border-radius:3px;transition:width 0.6s;"></div>
+              </div>`;
+          }}
+          return `
+          <div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:14px 16px;">
+            <div style="font-size:11px;color:rgba(255,255,255,0.45);margin-bottom:4px;">${{title}}</div>
+            <div style="font-size:18px;font-weight:bold;color:white;">${{mCurr ? mCurr[key].toFixed(key==='sharpe'?2:1)+unit : '-'}}</div>
+            ${{deltaBar(mImp1, mCurr, '개선안 1')}}
+            ${{deltaBar(mImp2, mCurr, '개선안 2')}}
+          </div>`;
+        }}).join('')}}
+      </div>
+    </div>` : ''}}
+
+  </div>
+</div>`;
+
+  Plotly.newPlot(cumId, traces, {{
+    template:'plotly_dark', paper_bgcolor:'#161622', plot_bgcolor:'#161622',
+    margin:{{l:50,r:20,t:20,b:40}},
+    xaxis:{{showgrid:true, gridcolor:'#1e2d3d', tickfont:{{color:'rgba(255,255,255,0.7)'}}}},
+    yaxis:{{title:{{text:'누적 수익률 (100 시작)', font:{{color:'rgba(255,255,255,0.7)'}}}},
+            showgrid:true, gridcolor:'#1e2d3d', tickfont:{{color:'rgba(255,255,255,0.7)'}}}},
+    legend:{{orientation:'h', y:-0.18, x:0.5, xanchor:'center', font:{{color:'rgba(255,255,255,0.8)',size:11}}}},
+    font:{{family:'Malgun Gothic'}}, dragmode:'pan',
+  }}, {{responsive:true, displayModeBar:false, scrollZoom:true}});
+}}
+
+// ── 반응형 리사이즈 ────────────────────────────
+(function() {{
+  const chartIds = ['chart-cum','chart-yr','chart-dd','chart-pie'];
+  let resizeTimer;
+  window.addEventListener('resize', function() {{
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function() {{
+      chartIds.forEach(function(id) {{
+        const el = document.getElementById(id);
+        if (el && el.data && el.data.length > 0) {{
+          Plotly.relayout(id, {{autosize:true}});
+        }}
+      }});
+    }}, 150);
+  }});
+}})();
+
+// ── 결과 저장 (현재 페이지 HTML 전체 저장) ────────
+function saveSimulation() {{
+  const now      = new Date();
+  const dateStr  = now.toISOString().slice(0, 10);
+  const timeStr  = now.toTimeString().slice(0, 8).replace(/:/g, '-');
+  const filename = `포트폴리오_시뮬레이션_${{dateStr}}_${{timeStr}}.html`;
+
+  const html = '<!DOCTYPE html>\\n' + document.documentElement.outerHTML;
+  const blob = new Blob([html], {{type: 'text/html; charset=utf-8'}});
+  const url  = URL.createObjectURL(blob);
+
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}}
+
+// ── 초기화 ──────────────────────────────────────
+document.addEventListener('DOMContentLoaded', function() {{
+  updateAmounts();
+  _syncLayout();
+}});
+"""
+
+
+# ═══════════════════════════════════════════════
+# 메인
+# ═══════════════════════════════════════════════
+def main():
+    print("===== 포트폴리오_MP 시작 =====\n")
+
+    print("[1/5] ETF 가격 로드...")
+    price_df = load_all_prices()
+    print(f"      총 {len(price_df.columns)}개 ETF | "
+          f"{price_df.index[0].date()} ~ {price_df.index[-1].date()}")
+    available_tickers = price_df.columns.tolist()
+
+    print("[2/5] 월별 수익률 계산...")
+    monthly_ret = compute_monthly_returns(price_df)
+    returns_json = build_returns_json(monthly_ret)
+    print(f"      {len(monthly_ret)}개월, JSON {len(returns_json)//1024}KB")
+
+    print("[3/5] DTW 유사 구간 & 최적 비중 계산...")
+    print(f"      추론 기간: {INFER_START_DATE} ~ (학습 구간: ~ {TRAIN_END_DATE})")
+    macro_df = dtw_load_macro()
+    scores_m = dtw_build_scores(macro_df)
+    similar  = dtw_find_similar(scores_m)
+    if similar:
+        for i, (d, s) in enumerate(similar):
+            print(f"      #{i+1}  {d.strftime('%Y-%m')}  유사도 {s:.1f}%")
+    else:
+        print("      유사 구간 없음 — 추론 기간 데이터 부족 가능성 확인 필요")
+    all_allocs, sharpe = compute_all_dtw_allocs(monthly_ret, similar, fwd=12)
+    if all_allocs:
+        opt_w = all_allocs["Sharpe최적"]
+        print(f"      최적 샤프: {sharpe:.2f}")
+        for s, w in sorted(opt_w.items(), key=lambda x: -x[1]):
+            print(f"        {s}: {w:.1f}%")
+    else:
+        print("      최적 비중 산출 불가 → 기본값 사용")
+        opt_w = {"현금": 35.0, "방어주": 30.0, "가치주": 20.0, "성장주": 15.0}
+        sharpe = 0.80
+        all_allocs = {"Sharpe최적": opt_w, "_sharpe": sharpe}
+
+    print("[4/5] 국면 정보 로드...")
+    df_reg = pd.read_excel(RESULT_PATH, sheet_name="국면_시계열",
+                           index_col=0, parse_dates=True).sort_index()
+    regime_series   = df_reg["국면"].dropna()
+    current_regime  = regime_series.iloc[-1]
+    as_of           = regime_series.index[-1].strftime("%Y년 %m월")
+    print(f"      현재 국면: {current_regime} ({as_of})")
+
+    print("      국면 역사 기반 배분 계산...")
+    regime_allocs, regime_sharpe = compute_all_regime_allocs(
+        monthly_ret, regime_series, current_regime)
+    if regime_allocs:
+        print(f"      국면 역사 Sharpe: {regime_sharpe:.2f}")
+    else:
+        print("      국면 역사 배분 산출 불가 → DTW 기반으로 대체")
+        regime_allocs = all_allocs
+
+    print("[5/5] HTML 생성...")
+    html = build_html(
+        dtw_weights       = opt_w,
+        sharpe_dtw        = sharpe,
+        similar           = similar,
+        returns_json      = returns_json,
+        current_regime    = current_regime,
+        as_of             = as_of,
+        available_tickers = available_tickers,
+        all_allocs        = all_allocs,
+        regime_allocs     = regime_allocs,
+    )
+    OUTPUT_PATH.write_text(html, encoding="utf-8")
+    print(f"\n[완료] {OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    main()
