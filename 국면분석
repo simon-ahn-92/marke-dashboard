@@ -1,0 +1,638 @@
+# -*- coding: utf-8 -*-
+"""
+국면판단_v2.py  (CLAUDE.md Phase 1~2 구현)
+=====================================================================
+기존 HMM 모델 대비 주요 업그레이드:
+  1. Blended Percentile  : 단일 전체 창 → 36M/60M/120M 혼합 분위수
+  2. Composite Score     : Level(50%) + Momentum(35%) + Acceleration(15%)
+  3. EMA 스무딩(span=3M) + Confirmation Rule (2M 연속 45% 이상)
+  4. Shannon Entropy     → 불확실 구간 자동 "전환기(TRAN)" 선언
+  5. 명시적 지표 가중치 체계 (CLAUDE.md §3-1 준수)
+
+데이터 소스:
+  - 국면판단_원데이터.xlsx  : FRED 지표 (VIX, HY, 금리차, CPI, TIPS, BEI 등)
+  - 지수데이터.xlsx         : SP500 (Sheet6)
+  - 원자재 가격.csv         : 금현물가격(USD/oz) + 구리선물가격(USD/lb)
+
+출력: 국면판단_결과_v2.xlsx
+"""
+
+import sys, io
+import warnings
+import numpy as np
+import pandas as pd
+from scipy import stats as sp_stats
+from scipy.special import softmax
+from pathlib import Path
+
+warnings.filterwarnings("ignore")
+
+
+# =====================================================================
+# 경로 설정
+# =====================================================================
+BASE = Path(r"C:\python\성일\국면판단 모델")
+FRED_PATH   = BASE / "국면판단_원데이터.xlsx"
+INDEX_PATH  = BASE / "지수데이터.xlsx"
+COMMODITY_PATH = BASE / "원자재 가격.csv"   # 금 현물 + 구리 선물
+OUTPUT_PATH = BASE / "국면판단_결과_v2.xlsx"
+
+START_DATE  = "2000-01-01"
+
+
+# =====================================================================
+# 국면 & 지표 설정  (CLAUDE.md §2, §3)
+# =====================================================================
+PHASES      = ["붐(강세)", "골디락스", "스태그플레이션", "침체(위기)"]
+PHASE_CODES = ["BOOM",    "GOLD",     "STAG",           "RECE"]
+
+# (내부컬럼명, 표시명, 가중치, 방향유형, α_level, β_momentum, γ_accel)
+# 방향유형: "g_n"=성장↑좋음, "g_i"=성장↑나쁨(inverse), "inf"=물가이론임계
+INDICATORS = [
+    # ── 기존 지표 ──────────────────────────────────────────────────────────
+    ("VIX",              "VIX",              0.10, "g_i", 0.40, 0.40, 0.20),
+    ("HY스프레드",       "HY스프레드",        0.09, "g_i", 0.50, 0.35, 0.15),
+    ("금리차",           "장단기금리차",       0.10, "g_n", 0.45, 0.40, 0.15),
+    ("금융스트레스",     "금융스트레스",       0.06, "g_i", 0.50, 0.35, 0.15),
+    ("SP500_ret",        "S&P500 수익률",     0.08, "g_n", 0.50, 0.35, 0.15),
+    ("CPI_yoy",          "CPI YoY",           0.10, "inf", 0.60, 0.30, 0.10),
+    ("실질금리",         "실질금리(TIPS)",     0.08, "g_i", 0.50, 0.35, 0.15),
+    ("BEI_5Y5Y",         "기대인플레이션5Y5Y", 0.09, "inf", 0.50, 0.35, 0.15),
+    ("구리금비율",       "구리/금 비율",       0.05, "g_n", 0.50, 0.35, 0.15),
+    # ── 신규 지표 (FRED 확장) ────────────────────────────────────────────
+    ("Sahm룰침체지표",  "Sahm룰침체지표",    0.10, "g_i", 0.55, 0.30, 0.15),  # 0.5↑→침체 확정
+    ("INDPRO_yoy",      "산업생산YoY",        0.07, "g_n", 0.35, 0.50, 0.15),  # PMI 대용
+    ("PAYEMS_chg",      "비농업고용증가율",   0.05, "g_n", 0.30, 0.55, 0.15),  # 고용 사이클
+    ("PCE_yoy",         "근원PCE_YoY",        0.07, "inf", 0.60, 0.30, 0.10),  # Fed 선호 물가
+    ("IG크레딧스프레드", "IG크레딧스프레드",  0.04, "g_i", 0.50, 0.35, 0.15),  # 신용여건
+    ("PPI_yoy",         "PPI_YoY",            0.04, "inf", 0.55, 0.30, 0.15),  # 인플레 선행
+    # TED 스프레드: FRED 2023년 폐기로 제외
+]
+
+# Blended Percentile 창 (월) 및 가중치
+BLEND_WINDOWS  = [36, 60, 120]
+BLEND_WEIGHTS  = [0.50, 0.30, 0.20]
+
+# EMA / Confirmation
+EMA_SPAN    = 4      # 4개월 지수이동평균 (3→4: 노이즈 감소)
+CONFIRM_M   = 3      # 국면 확정에 필요한 연속 월수 (2→3: 잦은 전환 억제)
+CONFIRM_TH  = 0.35   # 확정 임계 확률 (CONFIRM_M 증가 보상으로 약간 완화)
+
+# Shannon Entropy 임계값 → 전환기(TRAN) 선언 (4국면 최대 ≈ 1.386)
+# 1.30 ≈ 1위 국면 확률 약 43% 이하일 때 전환기 선언 (기존 1.35: 38%)
+ENTROPY_TH  = 1.30
+
+# Softmax 온도 (낮을수록 확률 집중; 0.55: 신호 강조)
+TEMPERATURE = 0.55
+
+# ─────────────────────────────────────────────────────────
+# 학습 / 추론 구간 분리
+#   학습 : START_DATE ~ TRAIN_END_DATE  (백분위 기준 분포 고정)
+#   추론 : INFER_START_DATE ~ 현재      (학습 분포에 비추어 평가)
+# ─────────────────────────────────────────────────────────
+TRAIN_END_DATE   = "2025-12-31"
+INFER_START_DATE = "2026-01-01"
+
+
+# =====================================================================
+# 1. 데이터 로드 및 월별 집계
+# =====================================================================
+def _load_fred_monthly() -> pd.DataFrame:
+    """FRED 일간/월간 데이터 → 월말 기준 집계"""
+    daily   = pd.read_excel(FRED_PATH, sheet_name="일간데이터",
+                             index_col=0, parse_dates=True).sort_index()
+    monthly = pd.read_excel(FRED_PATH, sheet_name="월간데이터",
+                             index_col=0, parse_dates=True).sort_index()
+
+    # 금 컬럼명 통일
+    if "금현물가격(USD/oz)" in daily.columns and "금현물가격" not in daily.columns:
+        daily = daily.rename(columns={"금현물가격(USD/oz)": "금현물가격"})
+
+    # 심리지수 시트 (있으면 병합)
+    try:
+        sentiment = pd.read_excel(FRED_PATH, sheet_name="심리지수",
+                                   index_col=0, parse_dates=True).sort_index()
+        daily_s = sentiment.reindex(daily.index, method="ffill")
+        daily   = pd.concat([daily, daily_s], axis=1)
+    except Exception:
+        pass
+
+    # 일간 → 월말 평균
+    daily_m = daily.resample("ME").mean()
+    # 월간 데이터는 이미 월별이므로 월말 인덱스로 통일
+    monthly.index = monthly.index + pd.offsets.MonthEnd(0)
+    monthly_m = monthly.resample("ME").last()
+
+    df = pd.concat([daily_m, monthly_m], axis=1)
+    df = df[df.index >= START_DATE].sort_index()
+    return df
+
+
+def _load_index_monthly() -> pd.DataFrame:
+    """지수데이터.xlsx Sheet6 → SP500 월말 가격"""
+    try:
+        raw = pd.read_excel(INDEX_PATH, sheet_name="Sheet6", header=None)
+        col_names = raw.iloc[8, 1:].tolist()
+        data = raw.iloc[14:].copy()
+        data.columns = ["Date"] + col_names
+        data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
+        data = data.dropna(subset=["Date"]).set_index("Date").sort_index()
+        for c in data.columns:
+            data[c] = pd.to_numeric(data[c], errors="coerce")
+        rename = {"S&P 500": "SP500", "US Dollar Index": "달러인덱스DXY"}
+        data = data.rename(columns=rename)
+        return data[["SP500"]].resample("ME").last()
+    except Exception as e:
+        print(f"    [경고] 지수데이터 로드 실패: {e}")
+        return pd.DataFrame()
+
+
+def _load_commodity_monthly() -> tuple:
+    """원자재 가격.csv → (금현물가격 월말 Series, 구리선물가격 월말 Series)"""
+    if not COMMODITY_PATH.exists():
+        print(f"    [경고] 원자재 가격.csv 없음 → 금/구리 데이터 없음")
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+    try:
+        df = pd.read_csv(COMMODITY_PATH, header=0, encoding="cp949")
+        df.columns = ["Date", "금현물가격", "구리선물가격"]
+        df["Date"] = pd.to_datetime(df["Date"], format="%m/%d/%Y", errors="coerce")
+        df["금현물가격"]   = pd.to_numeric(df["금현물가격"].astype(str).str.replace(",", ""), errors="coerce")
+        df["구리선물가격"] = pd.to_numeric(df["구리선물가격"].astype(str).str.replace(",", ""), errors="coerce")
+        df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+        gold_m   = df["금현물가격"].resample("ME").last().rename("금현물가격")
+        copper_m = df["구리선물가격"].resample("ME").last().rename("구리선물가격")
+        return gold_m, copper_m
+    except Exception as e:
+        print(f"    [경고] 원자재 가격.csv 로드 실패: {e}")
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+
+
+def build_monthly_df() -> pd.DataFrame:
+    """모든 소스 병합 + 파생 지표 계산"""
+    fred             = _load_fred_monthly()
+    idx              = _load_index_monthly()
+    gold_s, copper_s = _load_commodity_monthly()
+
+    df = fred.copy()
+
+    # SP500: 지수데이터 우선, 없으면 FRED
+    if not idx.empty and "SP500" in idx.columns:
+        df["SP500"] = idx["SP500"].reindex(df.index, method="ffill")
+    # 금/구리: 원자재 가격.csv
+    if not gold_s.empty:
+        df["금현물가격"] = gold_s.reindex(df.index, method="ffill")
+    if not copper_s.empty:
+        df["구리선물가격"] = copper_s.reindex(df.index, method="ffill")
+
+    # ── 파생 지표 ──────────────────────────────────────
+    # SP500 월수익률
+    if "SP500" in df.columns:
+        df["SP500_ret"] = df["SP500"].pct_change() * 100   # %
+
+    # CPI YoY
+    if "미국CPI" in df.columns:
+        df["CPI_yoy"] = df["미국CPI"].pct_change(12) * 100
+
+    # 근원PCE YoY
+    if "근원PCE" in df.columns:
+        df["PCE_yoy"] = df["근원PCE"].pct_change(12) * 100
+
+    # PPI YoY
+    if "PPI생산자물가" in df.columns:
+        df["PPI_yoy"] = df["PPI생산자물가"].pct_change(12) * 100
+
+    # 산업생산 YoY (ISM PMI 대용)
+    if "산업생산지수" in df.columns:
+        df["INDPRO_yoy"] = df["산업생산지수"].pct_change(12) * 100
+
+    # 비농업고용 MoM 변화율
+    if "비농업취업자수" in df.columns:
+        df["PAYEMS_chg"] = df["비농업취업자수"].pct_change() * 100
+
+    # 구리/금 비율
+    if "구리선물가격" in df.columns and "금현물가격" in df.columns:
+        df["구리금비율"] = df["구리선물가격"] / df["금현물가격"]
+        print("    [OK] 구리/금 비율 계산됨")
+    else:
+        print("    [정보] 구리 또는 금 데이터 없음 → 구리/금 비율 지표 제외")
+
+    # ── 컬럼명 매핑 (내부 표준명) ──────────────────────
+    rename = {
+        "VIX":                  "VIX",
+        "HY크레딧스프레드":     "HY스프레드",
+        "장단기금리차(10Y-2Y)": "금리차",
+        "금융스트레스지수(STL)":"금융스트레스",
+        "실질금리TIPS10Y":      "실질금리",
+        "기대인플레이션5Y5Y":   "BEI_5Y5Y",
+        # 신규 지표는 data_collect의 컬럼명 그대로 사용
+        # ("Sahm룰침체지표", "산업생산지수", "비농업취업자수", "근원PCE",
+        #  "PPI생산자물가", "IG크레딧스프레드") → 파생 컬럼으로 변환됨
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+
+    return df[df.index >= START_DATE].sort_index()
+
+
+# =====================================================================
+# 2. Blended Percentile 엔진  (CLAUDE.md §4-2)
+# =====================================================================
+def blended_percentile(series: pd.Series, t: int,
+                        windows: list = BLEND_WINDOWS,
+                        weights: list = BLEND_WEIGHTS,
+                        train_end_t: int | None = None) -> float:
+    """
+    단기(36M)/중기(60M)/장기(120M) 백분위 가중 혼합.
+
+    train_end_t 지정 시:
+      - 학습 구간(t <= train_end_t): 기존과 동일, t 기준 롤링 창
+      - 추론 구간(t > train_end_t) : hist_end를 train_end_t로 고정
+        → 현재 값을 학습 기간 분포에 비추어 평가 (분포 오염 방지)
+    반환값: 0~1
+    """
+    val = series.iloc[t]
+    if pd.isna(val):
+        return np.nan
+
+    # 추론 구간이면 참조 분포 끝점을 학습 끝으로 고정
+    hist_end = (train_end_t
+                if (train_end_t is not None and t > train_end_t)
+                else t)
+
+    pcts = []
+    for w in windows:
+        hist = series.iloc[max(0, hist_end - w):hist_end].dropna()
+        if len(hist) < 12:   # 최소 12개월 필요
+            pcts.append(0.5)
+            continue
+        pcts.append(sp_stats.percentileofscore(hist, val, kind="rank") / 100)
+    return float(np.dot(pcts, weights))
+
+
+# =====================================================================
+# 3. Composite Score  (CLAUDE.md §4-1)
+# =====================================================================
+def composite_score(series: pd.Series, t: int,
+                    alpha: float = 0.50, beta: float = 0.35, gamma: float = 0.15,
+                    m: int = 1,
+                    train_end_t: int | None = None) -> float:
+    """
+    Level(α) + Momentum(β) + Acceleration(γ) 복합 백분위 스코어.
+    train_end_t: blended_percentile에 전달 (추론 구간 분포 고정)
+    반환값: 0~1
+    """
+    if t < 3:
+        return np.nan
+    kw = dict(train_end_t=train_end_t)
+    level_pct = blended_percentile(series,             t, **kw)
+    mom_pct   = blended_percentile(series.diff(m),     t, **kw)
+    accel_pct = blended_percentile(series.diff(m).diff(1), t, **kw)
+    vals = [level_pct, mom_pct, accel_pct]
+    if any(np.isnan(v) for v in vals):
+        return np.nan
+    return alpha * level_pct + beta * mom_pct + gamma * accel_pct
+
+
+# =====================================================================
+# 4. 성장 지표 점수 매핑  (composite_pct → 4국면 점수)
+# =====================================================================
+def _growth_score(pct: float) -> np.ndarray:
+    """
+    성장 지표 복합 백분위 → [BOOM, GOLD, STAG, RECE] 점수.
+    성장 지표는 주로 (BOOM+GOLD) vs (STAG+RECE) 축 분리.
+    pct: 0~1, direction 보정 후 (high = 성장 강세)
+
+    NOTE: 성장 지표 자체는 STAG vs RECE를 구분하지 않음.
+    STAG/RECE 판별은 인플레이션 지표(CPI/BEI, 합산 weight ~0.25)가 담당.
+    """
+    if pct >= 0.80: return np.array([ 2.0,  2.0, -1.5, -2.5])
+    if pct >= 0.65: return np.array([ 1.5,  1.5, -1.0, -1.5])
+    if pct >= 0.50: return np.array([ 0.5,  0.5, -0.3, -0.5])
+    if pct >= 0.35: return np.array([-0.5, -0.5,  0.5,  1.0])
+    if pct >= 0.20: return np.array([-1.5, -1.0,  1.0,  2.0])
+    return              np.array([-2.0, -1.5,  1.5,  3.0])
+
+
+# =====================================================================
+# 5. 물가 지표 이론 임계값 매핑  (CLAUDE.md §3-2, §4-3)
+# =====================================================================
+def _inflation_theory_score(col: str, raw_val: float) -> np.ndarray:
+    """
+    CPI YoY / BEI 5Y5Y 절대 레벨 → [BOOM, GOLD, STAG, RECE] 점수.
+    물가 지표는 주로 (BOOM+STAG) vs (GOLD+RECE) 축 분리.
+    """
+    if col == "CPI_yoy":
+        if raw_val > 5.0: return np.array([ 1.0, -2.5,  3.0, -1.5])
+        if raw_val > 3.5: return np.array([ 2.0, -1.0,  1.5, -1.5])
+        if raw_val > 2.0: return np.array([ 1.5,  0.5, -0.5, -1.0])
+        return              np.array([-0.5,  2.0, -2.0,  0.5])
+
+    elif col == "BEI_5Y5Y":   # CLAUDE.md §3-2 임계값 준수
+        if raw_val > 2.8: return np.array([ 1.0, -2.0,  3.0, -1.5])  # 스태그 강신호
+        if raw_val > 2.2: return np.array([ 2.0, -0.5,  0.5, -1.0])  # 붐 신호
+        if raw_val > 1.8: return np.array([ 0.5,  2.0, -1.0, -0.5])  # 골디락스
+        return              np.array([-1.5,  0.5, -2.0,  1.5])        # 침체 우려
+
+    elif col == "PCE_yoy":    # Fed 목표 2% 기준 (CPI보다 약 0.3%p 낮음)
+        if raw_val > 3.5: return np.array([ 0.5, -2.5,  3.0, -1.5])  # 스태그플레이션
+        if raw_val > 2.5: return np.array([ 1.5, -0.5,  1.0, -1.5])  # 인플레 우려
+        if raw_val > 1.5: return np.array([ 1.0,  2.0, -1.0, -0.5])  # 골디락스 (목표권)
+        return              np.array([-0.5,  1.0, -2.0,  1.5])        # 저물가/침체 우려
+
+    elif col == "PPI_yoy":    # 생산자물가 — CPI 3~6개월 선행
+        if raw_val > 6.0: return np.array([ 0.5, -2.0,  3.5, -1.5])  # 극심한 코스트푸시
+        if raw_val > 3.0: return np.array([ 1.5, -1.0,  1.5, -1.5])  # 인플레 상승 압력
+        if raw_val > 1.0: return np.array([ 1.0,  2.0, -0.5, -0.5])  # 완만한 회복
+        return              np.array([-1.0,  0.5, -1.5,  2.0])        # 디플레이션 압력
+
+    return np.zeros(4)
+
+
+# =====================================================================
+# 6. 전체 지표 집계 → 국면 점수 행렬
+# =====================================================================
+def compute_phase_scores(df: pd.DataFrame,
+                         train_end_t: int | None = None) -> pd.DataFrame:
+    """
+    각 시점(월)에 대해 모든 지표의 가중 합산 점수 계산.
+    train_end_t: 학습 구간 마지막 정수 인덱스.
+                 추론 구간(t > train_end_t)은 학습 분포 기준으로 평가.
+    반환: DataFrame (index=날짜, columns=PHASE_CODES)
+    """
+    T           = len(df)
+    scores_arr  = np.zeros((T, 4))
+    contrib_log = []                # 최신 시점 기여도 기록
+
+    for col, label, weight, dtype, alpha, beta, gamma in INDICATORS:
+        if col not in df.columns:
+            continue
+
+        series = df[col]
+        latest_contrib = None
+
+        for t in range(T):
+            raw = series.iloc[t]
+            if pd.isna(raw):
+                continue
+
+            if dtype == "inf":
+                # 물가 지표: composite score + theory 임계값 점수 혼합
+                cpct = composite_score(series, t, alpha, beta, gamma,
+                                       train_end_t=train_end_t)
+                if np.isnan(cpct):
+                    continue
+                theory_s = _inflation_theory_score(col, raw)
+                accel_s  = _growth_score(cpct) * np.array([-1, 1, -1, 1])
+                score = theory_s * 0.65 + accel_s * 0.35
+            else:
+                # 성장 지표: direction 보정 후 composite_score
+                cpct = composite_score(series, t, alpha, beta, gamma,
+                                       train_end_t=train_end_t)
+                if np.isnan(cpct):
+                    continue
+                if dtype == "g_i":
+                    cpct = 1.0 - cpct
+                score = _growth_score(cpct)
+
+            scores_arr[t] += score * weight
+
+            if t == T - 1:
+                latest_contrib = {"지표": label, "가중치": weight,
+                                  "유형": dtype,
+                                  "점수_BOOM": round(score[0] * weight, 3),
+                                  "점수_GOLD": round(score[1] * weight, 3),
+                                  "점수_STAG": round(score[2] * weight, 3),
+                                  "점수_RECE": round(score[3] * weight, 3)}
+        if latest_contrib:
+            contrib_log.append(latest_contrib)
+
+    score_df = pd.DataFrame(scores_arr, index=df.index, columns=PHASE_CODES)
+    return score_df, pd.DataFrame(contrib_log)
+
+
+
+
+
+# =====================================================================
+# 7. Softmax → 국면 확률  (CLAUDE.md §5-1)
+# =====================================================================
+def compute_probabilities(score_df: pd.DataFrame,
+                          temperature: float = TEMPERATURE) -> pd.DataFrame:
+    """가중 합산 점수 → Softmax 확률 (합=100%)"""
+    arr  = score_df.values
+    prob = softmax(arr / temperature, axis=1)
+    return pd.DataFrame(prob, index=score_df.index, columns=PHASES)
+
+
+# =====================================================================
+# 8. EMA 스무딩 + Confirmation Rule  (CLAUDE.md §5-2)
+# =====================================================================
+def smooth_and_confirm(prob_df: pd.DataFrame,
+                       ema_span: int    = EMA_SPAN,
+                       confirm_m: int   = CONFIRM_M,
+                       confirm_th: float = CONFIRM_TH) -> pd.DataFrame:
+    """
+    Step1: EMA 스무딩 (span개월)
+    Step2: 재정규화
+    Step3: Confirmation Rule — confirm_m 연속 confirm_th 초과 시 국면 확정
+    """
+    smoothed = prob_df.ewm(span=ema_span, adjust=False).mean()
+    smoothed = smoothed.div(smoothed.sum(axis=1), axis=0)
+
+    confirmed = []
+    current   = None
+    streak    = 0
+    candidate = None
+
+    for _, row in smoothed.iterrows():
+        dominant = row.idxmax()
+        if row[dominant] > confirm_th:
+            if dominant == candidate:
+                streak += 1
+            else:
+                candidate = dominant
+                streak    = 1
+            if streak >= confirm_m:
+                current = candidate
+        else:
+            streak = 0   # 임계값 미달 시 연속 카운트 초기화
+        confirmed.append(current)
+
+    smoothed["확정국면"] = confirmed
+    return smoothed
+
+
+# =====================================================================
+# 9. Shannon Entropy → 전환기(TRAN) 감지  (CLAUDE.md §5-3)
+# =====================================================================
+def detect_transition(prob_row: np.ndarray,
+                      threshold: float = ENTROPY_TH) -> bool:
+    """4국면 최대 엔트로피 ≈ 1.386; threshold 초과 시 전환기 선언"""
+    p       = np.clip(prob_row, 1e-9, 1.0)
+    entropy = -np.sum(p * np.log(p))
+    return bool(entropy > threshold)
+
+
+def apply_transition_flag(smoothed_df: pd.DataFrame) -> pd.DataFrame:
+    """확률 행렬에 TRAN 플래그 열 추가"""
+    prob_cols = [c for c in smoothed_df.columns if c in PHASES]
+    smoothed_df["전환기"] = smoothed_df[prob_cols].apply(
+        lambda row: detect_transition(row.values), axis=1
+    )
+    smoothed_df["국면"] = smoothed_df.apply(
+        lambda row: "전환기(TRAN)" if row["전환기"] else (row["확정국면"] or "미확정"),
+        axis=1
+    )
+    return smoothed_df
+
+
+# =====================================================================
+# 10. 저장
+# =====================================================================
+def save_results(smoothed_df: pd.DataFrame, score_df: pd.DataFrame,
+                 contrib_df: pd.DataFrame, monthly_df: pd.DataFrame):
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    train_end_ts = pd.Timestamp(TRAIN_END_DATE)
+    prob_cols = [c for c in smoothed_df.columns if c in PHASES]
+
+    regime_ts = smoothed_df[["국면"]].copy()
+    regime_ts["구간구분"] = [
+        "추론" if d > train_end_ts else "학습"
+        for d in regime_ts.index
+    ]
+    regime_ts.index.name = "Date"
+
+    prob_ts = smoothed_df[prob_cols].copy()
+    prob_ts.index.name = "Date"
+
+    with pd.ExcelWriter(OUTPUT_PATH, engine="xlsxwriter",
+                        date_format="yyyy-mm-dd") as writer:
+        # 기존 결과 파일과 동일한 시트명 → 시각화 코드 호환
+        regime_ts.to_excel(writer, sheet_name="국면_시계열")
+        prob_ts.to_excel(writer, sheet_name="국면_확률")
+        smoothed_df.to_excel(writer, sheet_name="국면_확률_상세")
+        score_df.to_excel(writer, sheet_name="원점수")
+        if not contrib_df.empty:
+            contrib_df.to_excel(writer, sheet_name="지표_기여도", index=False)
+
+        # 지표 사용 현황 (monthly_df 컬럼 기준으로 판단)
+        summary = []
+        for col, label, weight, dtype, *_ in INDICATORS:
+            used = "O" if col in monthly_df.columns else "X (데이터 없음)"
+            summary.append({"지표": label, "컬럼": col,
+                             "가중치": weight, "유형": dtype, "사용여부": used})
+        pd.DataFrame(summary).to_excel(writer, sheet_name="지표현황", index=False)
+
+    print(f"\n[완료] 저장: {OUTPUT_PATH}")
+
+
+# =====================================================================
+# 11. 현재 국면 진단 출력
+# =====================================================================
+def print_current_diagnosis(smoothed_df: pd.DataFrame):
+    latest = smoothed_df.iloc[-1]
+    prob_cols = [c for c in smoothed_df.columns if c in PHASES]
+    print("\n" + "=" * 55)
+    print(f"  현재 국면 진단  ({smoothed_df.index[-1].strftime('%Y-%m')})")
+    print("=" * 55)
+    print(f"  확정 국면  : {latest['국면']}")
+    print(f"  전환기 여부: {'예 (신호 혼재)' if latest['전환기'] else '아니오'}")
+    print()
+    print("  국면별 확률 (EMA 스무딩 후):")
+    for phase in prob_cols:
+        bar = "#" * int(latest[phase] * 30)
+        print(f"    {phase:<14s} {latest[phase]*100:5.1f}%  {bar}")
+    print("=" * 55)
+
+
+# =====================================================================
+# 12. 메인 파이프라인
+# =====================================================================
+def main():
+    print("===== 국면판단 v2 시작 =====\n")
+
+    print("[1/5] 월별 데이터 로드...")
+    df = build_monthly_df()
+    avail = [col for col, *_ in INDICATORS if col in df.columns]
+    print(f"      전체 기간: {df.index[0].strftime('%Y-%m')} ~ "
+          f"{df.index[-1].strftime('%Y-%m')}  ({len(df)}개월)")
+    print(f"      사용 지표 ({len(avail)}/{len(INDICATORS)}개): "
+          f"{', '.join(avail)}")
+
+    # ── 학습 / 추론 구간 분리 ──────────────────────────────
+    train_mask  = df.index <= pd.Timestamp(TRAIN_END_DATE)
+    infer_mask  = df.index >= pd.Timestamp(INFER_START_DATE)
+    train_end_t = int(np.where(train_mask)[0][-1]) if train_mask.any() else None
+
+    n_train = train_mask.sum()
+    n_infer = infer_mask.sum()
+    print(f"\n      ┌─ 학습 구간: {df.index[0].strftime('%Y-%m')} ~ "
+          f"{TRAIN_END_DATE[:7]}  ({n_train}개월) ← 백분위 기준 분포 고정")
+    if n_infer > 0:
+        print(f"      └─ 추론 구간: {INFER_START_DATE[:7]} ~ "
+              f"{df.index[-1].strftime('%Y-%m')}  ({n_infer}개월) ← 학습 분포 기준 평가")
+    else:
+        print(f"      └─ 추론 구간: 없음 (현재 날짜가 {TRAIN_END_DATE} 이전)")
+
+    print("\n[2/5] Composite Score 계산 (Blended Percentile)...")
+    score_df, contrib_df = compute_phase_scores(df, train_end_t=train_end_t)
+    print(f"      점수 계산 완료: {score_df.shape}")
+
+    print("\n[3/5] Softmax → 국면 확률...")
+    prob_df = compute_probabilities(score_df)
+
+    print("[4/5] EMA 스무딩 + Confirmation Rule + Entropy 감지...")
+    smoothed_df = smooth_and_confirm(prob_df)
+    smoothed_df = apply_transition_flag(smoothed_df)
+
+    # ── 구간별 국면 분포 출력 ──────────────────────────────
+    print("\n  [학습 구간] 국면별 발생 월수:")
+    train_regimes = smoothed_df.loc[train_mask, "국면"].value_counts()
+    for regime, cnt in train_regimes.items():
+        print(f"    {regime:<18s}: {cnt}개월")
+
+    if n_infer > 0:
+        print("\n  [추론 구간] 국면별 발생 월수:")
+        infer_regimes = smoothed_df.loc[infer_mask, "국면"].value_counts()
+        for regime, cnt in infer_regimes.items():
+            print(f"    {regime:<18s}: {cnt}개월")
+
+        # 추론 구간 각 지표의 학습 분포 대비 백분위 출력
+        print("\n  [추론 구간] 현재 지표 수준 (학습 분포 기준 백분위):")
+        print(f"  {'지표':<20s} {'현재값':>10s} {'백분위':>8s}  해석")
+        print("  " + "-" * 60)
+        for ind in INDICATORS:
+            col, label, dtype = ind[0], ind[1], ind[3]
+            if col not in df.columns or train_end_t is None:
+                continue
+            series = df[col]
+            infer_rows = df.index[infer_mask]
+            if infer_rows.empty:
+                continue
+            t_last = len(df) - 1
+            val = series.iloc[t_last]
+            if pd.isna(val):
+                continue
+            pct = blended_percentile(series, t_last,
+                                     train_end_t=train_end_t) * 100
+            # 방향 보정: g_i는 높을수록 나쁨 → 해석 반전
+            if dtype == "g_i":
+                interp = "극단적 위험" if pct > 85 else ("위험↑" if pct > 65 else
+                         ("중립" if pct > 35 else ("안정" if pct > 15 else "극단적 안정")))
+            elif dtype == "g_n":
+                interp = "극단적 강세" if pct > 85 else ("강세" if pct > 65 else
+                         ("중립" if pct > 35 else ("약세" if pct > 15 else "극단적 약세")))
+            else:  # inf
+                interp = "고물가" if pct > 70 else ("중립" if pct > 30 else "저물가")
+            print(f"  {label:<20s} {val:>10.3f} {pct:>7.1f}%  {interp}")
+
+    print_current_diagnosis(smoothed_df)
+
+    print("\n[5/5] 결과 저장...")
+    save_results(smoothed_df, score_df, contrib_df, df)
+
+
+if __name__ == "__main__":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+    main()
