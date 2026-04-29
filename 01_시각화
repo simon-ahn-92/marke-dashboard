@@ -1,0 +1,2675 @@
+# -*- coding: utf-8 -*-
+"""
+시각화_03_v3.py  (시각화_02 + 시각화_04 통합 버전)
+- 탭1: 📈 시장 대시보드 (시각화_02 인터랙티브, 사이드바 포함)
+- 탭2: ⚠️  위기 국면 비교 분석  (코사인 유사도 + DTW 유사도 타임라인)
+- 탭3: 📊 국면별 자산 성과
+- 탭4: 📅 월별 수익률 히트맵
+"""
+
+import sys, io, json
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy.spatial.distance import cosine
+from collections import OrderedDict
+from dtaidistance import dtw
+import warnings
+warnings.filterwarnings("ignore")
+
+# ===== 경로 =====
+FRED_PATH   = r"C:\python\성일\국면판단 모델\국면판단_원데이터.xlsx"
+INDEX_PATH  = r"C:\python\성일\국면판단 모델\지수데이터.xlsx"
+RESULT_PATH = r"C:\python\성일\국면판단 모델\국면판단_결과_v2.xlsx"
+
+# 학습 / 추론 경계 (국면판단_v2 와 동일 기준)
+TRAIN_END_DATE   = "2025-12-31"
+INFER_START_DATE = "2026-01-01"
+OUTPUT_PATH = r"C:\python\성일\국면판단 모델\국면판단_시각화_03_v3.html"
+
+# ===== 자산 정의 (히트맵용) =====
+ASSET_LIST = [
+    ("SP500",            "S&P 500"),
+    ("NASDAQ100",        "NASDAQ 100"),
+    ("DowJones",         "Dow Jones"),
+    ("NIKKEI225",        "NIKKEI 225"),
+    ("Shanghai",         "Shanghai"),
+    ("KOSPI",            "KOSPI"),
+    ("달러인덱스DXY",    "달러 인덱스"),
+    ("금현물가격",       "금"),
+    ("WTI원유",          "WTI 원유"),
+    ("미국7-10년국채TR", "미국채(7-10Y)"),
+    ("미국HY채권TR",     "HY 채권"),
+    ("미국IG채권TR",     "IG 채권"),
+]
+
+MONTH_KR = ["1월","2월","3월","4월","5월","6월",
+            "7월","8월","9월","10월","11월","12월"]
+
+# 국면 색상 (히트맵 배경용)
+REGIME_COLORS_SOLID = {
+    "붐(강세)":       "#27ae60",
+    "골디락스":       "#2980b9",
+    "스태그플레이션": "#e67e22",
+    "침체(위기)":     "#c0392b",
+    "전환기(TRAN)":   "#9b59b6",
+    "미확정":         "#95a5a6",
+}
+
+
+# ═══════════════════════════════════════════════════════════
+# ▼▼▼  시각화_02 통합 상수 (대시보드 탭용)  ▼▼▼
+# ═══════════════════════════════════════════════════════════
+
+# 위기 구간 색상
+CRISIS_PERIODS = [
+    ("2000-03-01", "2002-10-31", "닷컴버블",    "#e91e63"),
+    ("2008-09-01", "2009-06-30", "리먼브라더스", "#8d6e63"),
+    ("2011-07-01", "2011-11-30", "유럽재정위기", "#fdd835"),
+    ("2018-10-01", "2019-01-31", "미중무역전쟁", "#26c6da"),
+    ("2020-02-01", "2020-04-30", "코로나19",     "#00897b"),
+    ("2022-01-01", "2022-10-31", "인플레·긴축",  "#f06292"),
+    ("2026-01-01", None,         "현재(2026~)",  "#b39ddb"),
+]
+
+REGIME_COLORS = {
+    "붐(강세)":       "rgba(46,204,113,0.18)",
+    "골디락스":       "rgba(46,115,161,0.18)",
+    "스태그플레이션": "rgba(243,156,18,0.18)",
+    "침체(위기)":     "rgba(231,76,60,0.18)",
+    "전환기(TRAN)":   "rgba(155,89,182,0.18)",
+    "미확정":         "rgba(149,165,166,0.12)",
+}
+REGIME_LINE_COLORS = {
+    "붐(강세)":       "#27ae60",
+    "골디락스":       "#2e73a1",
+    "스태그플레이션": "#e67e22",
+    "침체(위기)":     "#c0392b",
+    "전환기(TRAN)":   "#9b59b6",
+    "미확정":         "#95a5a6",
+}
+
+# (col_key, display, source, right_axis, color, default_visible, group)
+OVERLAY_SERIES = [
+    ("SP500",             "S&P 500",        "index", False, "#2ecc71", True,  "📈 지수"),
+    ("NASDAQ100",         "NASDAQ 100",     "index", False, "#3498db", False, "📈 지수"),
+    ("DowJones",          "Dow Jones",      "index", False, "#9b59b6", False, "📈 지수"),
+    ("NIKKEI225",         "NIKKEI 225",     "index", False, "#e67e22", False, "📈 지수"),
+    ("Shanghai",          "Shanghai",       "index", False, "#c0392b", False, "📈 지수"),
+    ("KOSPI",             "KOSPI",          "index", False, "#1abc9c", False, "📈 지수"),
+    ("달러인덱스DXY",     "달러 인덱스",    "index", False, "#f39c12", False, "💰 기타"),
+    ("금현물가격",        "금",             "fred",  False, "#f1c40f", False, "💰 기타"),
+    ("WTI원유",           "WTI 원유",       "fred",  False, "#a0522d", False, "💰 기타"),
+    ("미국IG채권TR",      "IG 채권(TR)",    "fred",  False, "#00bcd4", False, "💰 기타"),
+    ("미국HY채권TR",      "HY 채권(TR)",    "fred",  False, "#ff7043", False, "💰 기타"),
+    ("미국7-10년국채TR",  "미국채(7-10Y)",  "fred",  False, "#78909c", False, "💰 기타"),
+    ("VIX",               "VIX",            "fred",  True,  "#8e44ad", False, "📊 금리·지표"),
+    ("미국기준금리(FFR)", "기준금리(FFR)",  "fred",  True,  "#e74c3c", False, "📊 금리·지표"),
+    ("미국채10년",        "미국채 10년",    "fred",  True,  "#5dade2", False, "📊 금리·지표"),
+    ("미국채2년",         "미국채 2년",     "fred",  True,  "#e67e22", False, "📊 금리·지표"),
+    ("장단기금리차(10Y-2Y)","장단기금리차", "fred",  True,  "#2ecc71", False, "📊 금리·지표"),
+    ("HY크레딧스프레드",  "HY 스프레드",   "fred",  True,  "#e74c3c", False, "📊 금리·지표"),
+    ("IG크레딧스프레드",  "IG 스프레드",   "fred",  True,  "#ff7043", False, "📊 금리·지표"),
+    ("실질금리TIPS10Y",   "실질금리(TIPS)", "fred",  True,  "#9b59b6", False, "📊 금리·지표"),
+    ("미국CPI",           "CPI",            "fred",  True,  "#f39c12", False, "📊 금리·지표"),
+    ("미국근원CPI",       "근원CPI",        "fred",  True,  "#e67e22", False, "📊 금리·지표"),
+    ("근원PCE",           "근원 PCE",       "fred",  True,  "#d35400", False, "📊 금리·지표"),
+    ("PPI생산자물가",     "PPI",            "fred",  True,  "#c0392b", False, "📊 금리·지표"),
+    ("미국실업률",        "실업률",         "fred",  True,  "#1abc9c", False, "📊 금리·지표"),
+    ("Sahm룰침체지표",   "Sahm룰",         "fred",  True,  "#e74c3c", False, "📊 금리·지표"),
+    ("산업생산지수",      "산업생산지수",   "fred",  True,  "#27ae60", False, "📊 금리·지표"),
+    ("비농업취업자수",    "비농업고용(천)", "fred",  False, "#16a085", False, "📊 금리·지표"),
+    ("소매판매",          "소매판매",       "fred",  False, "#8e44ad", False, "📊 금리·지표"),
+    ("M2통화량",          "M2 통화량",      "fred",  False, "#78909c", False, "📊 금리·지표"),
+]
+PROB_REGIMES = ["붐(강세)", "골디락스", "스태그플레이션", "침체(위기)"]
+PROB_COLORS  = ["#27ae60", "#2980b9", "#f39c12", "#e74c3c"]
+
+CRISIS_HOVER_INFO = {
+    "닷컴버블": {
+        "title": "닷컴버블 붕괴",
+        "period": "2000.03 ~ 2002.10",
+        "indicators": [
+            ["VIX",        "급등 (최고 45 이상)"],
+            ["NASDAQ",     "–78%  /  S&P500 –49%"],
+            ["장단기금리차", "역전 → 회복"],
+            ["HY 스프레드", "급격히 확대"],
+            ["채권·금",    "주식 하락 속 상대 강세"],
+        ],
+        "note": "IT·통신 기술주 거품 붕괴. 연준 금리 인하로 점진적 회복"
+    },
+    "리먼브라더스": {
+        "title": "글로벌 금융위기",
+        "period": "2008.09 ~ 2009.06",
+        "indicators": [
+            ["VIX",        "역대 최고 (80 이상)"],
+            ["S&P500",     "–57%  |  전 자산 동반 급락"],
+            ["HY 스프레드", "역대 최고치 (+20%p)"],
+            ["달러",        "급격 강세 (안전자산 선호)"],
+            ["금",          "초기 하락 후 반등"],
+        ],
+        "note": "부동산·금융 시스템 붕괴. 역대 최대 유동성 공급으로 회복"
+    },
+    "유럽재정위기": {
+        "title": "유럽 재정위기",
+        "period": "2011.07 ~ 2011.11",
+        "indicators": [
+            ["VIX",        "급등 (45 이상)"],
+            ["S&P500",     "–20% 단기 조정"],
+            ["HY 스프레드", "확대"],
+            ["달러",        "강세"],
+            ["유럽 증시",   "S&P 대비 더 큰 낙폭"],
+        ],
+        "note": "PIIGS(포르투갈·이탈리아·아일랜드·그리스·스페인) 국채 위기"
+    },
+    "미중무역전쟁": {
+        "title": "미중 무역전쟁",
+        "period": "2018.10 ~ 2019.01",
+        "indicators": [
+            ["VIX",        "급등 (36)"],
+            ["S&P500",     "–20% 급락 조정"],
+            ["장단기금리차", "역전 시작"],
+            ["달러",        "강세"],
+            ["신흥국 증시", "상대적 약세"],
+        ],
+        "note": "관세 갈등 심화. 미중 1단계 합의 기대로 V자 반등"
+    },
+    "코로나19": {
+        "title": "코로나19 팬데믹",
+        "period": "2020.02 ~ 2020.04",
+        "indicators": [
+            ["VIX",        "급등 (80 이상)"],
+            ["S&P500",     "단기 –34% → V자 반등"],
+            ["CPI",        "저물가 → 이후 고물가 전환"],
+            ["장단기금리차", "급락 후 급반등"],
+            ["주식·채권",  "동반 약세 후 미국 주식 홀로 강세"],
+        ],
+        "note": "역대급 단기 충격. 대규모 재정·통화 부양으로 급속 회복"
+    },
+    "인플레·긴축": {
+        "title": "인플레이션 & 긴축 충격",
+        "period": "2022.01 ~ 2022.10",
+        "indicators": [
+            ["CPI",        "역대급 고물가 (최고 9.1%)"],
+            ["기준금리",    "0.25% → 4.50% 급격 인상"],
+            ["실질금리",    "마이너스 → 급등"],
+            ["주식+채권",  "동반 하락 (60/40 최악의 해)"],
+            ["달러·원자재", "강세"],
+        ],
+        "note": "전통 분산투자 전략 실패. 역대 가장 빠른 금리 인상 사이클"
+    },
+    "현재(2026~)": {
+        "title": "현재 (2026~)",
+        "period": "2026.01 ~ 진행중",
+        "indicators": [
+            ["VIX",        "상승 추세 (불확실성 고조)"],
+            ["S&P500",     "고점 대비 하락"],
+            ["장단기금리차", "역전 해소 → 회복"],
+            ["달러",        "약세 전환"],
+            ["관세·무역",  "트럼프 관세 불확실성"],
+        ],
+        "note": "스태그플레이션 리스크 상존. 성장 둔화 + 물가 재상승 우려"
+    },
+}
+
+# ═══════════════════════════════════════════════════════════
+# ▲▲▲  시각화_02 통합 상수 끝  ▲▲▲
+# ═══════════════════════════════════════════════════════════
+
+
+# =====================================
+# 데이터 로드 (공통)
+# =====================================
+def load_index_data() -> pd.DataFrame:
+    """지수 가격 데이터 — 국면판단_원데이터.xlsx 일간데이터에서 직접 로드"""
+    daily = pd.read_excel(FRED_PATH, sheet_name="일간데이터",
+                          index_col=0, parse_dates=True).sort_index()
+    if "금현물가격(USD/oz)" in daily.columns and "금현물가격" not in daily.columns:
+        daily = daily.rename(columns={"금현물가격(USD/oz)": "금현물가격"})
+    return daily
+
+
+def load_fred_assets() -> pd.DataFrame:
+    """FRED 일간데이터에서 자산 가격 컬럼 추출"""
+    try:
+        daily = pd.read_excel(FRED_PATH, sheet_name="일간데이터",
+                               index_col=0, parse_dates=True).sort_index()
+        if "금현물가격(USD/oz)" in daily.columns and "금현물가격" not in daily.columns:
+            daily = daily.rename(columns={"금현물가격(USD/oz)": "금현물가격"})
+        asset_cols = [c for c in ["금현물가격","WTI원유","미국IG채권TR",
+                                   "미국HY채권TR","미국7-10년국채TR"] if c in daily.columns]
+        return daily[asset_cols] if asset_cols else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_regime_monthly() -> pd.Series:
+    """국면 시계열 로드 — v2 결과는 이미 월별 인덱스"""
+    try:
+        regime_df = pd.read_excel(RESULT_PATH, sheet_name="국면_시계열",
+                                   index_col=0, parse_dates=True).sort_index()
+        return regime_df["국면"]
+    except Exception:
+        return pd.Series(dtype=str)
+
+
+def load_regime_period_type() -> pd.Series:
+    """학습/추론 구간구분 시계열 로드 (없으면 날짜 기준으로 생성)"""
+    try:
+        regime_df = pd.read_excel(RESULT_PATH, sheet_name="국면_시계열",
+                                   index_col=0, parse_dates=True).sort_index()
+        if "구간구분" in regime_df.columns:
+            return regime_df["구간구분"]
+    except Exception:
+        pass
+    # fallback: 날짜 기준으로 생성
+    regime = load_regime_monthly()
+    if regime.empty:
+        return pd.Series(dtype=str)
+    return regime.index.map(
+        lambda d: "추론" if d > pd.Timestamp(TRAIN_END_DATE) else "학습"
+    )
+
+
+def build_asset_df() -> pd.DataFrame:
+    """자산 일간 가격 — 국면판단_원데이터.xlsx 일간데이터 단일 소스"""
+    df = load_index_data()
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
+    df = df[~df.index.duplicated(keep="first")].sort_index()
+    return df
+
+
+# ═══════════════════════════════════════════════════════════
+# ▼▼▼  시각화_02 통합 함수 (대시보드 탭용)  ▼▼▼
+# ═══════════════════════════════════════════════════════════
+
+def load_data() -> pd.DataFrame:
+    """국면·FRED 데이터 로드 (대시보드용 — 월별 → 일별 ffill 확장)"""
+    regime_df = pd.read_excel(RESULT_PATH, sheet_name="국면_시계열",
+                               index_col=0, parse_dates=True).sort_index()
+    prob_df   = pd.read_excel(RESULT_PATH, sheet_name="국면_확률",
+                               index_col=0, parse_dates=True).sort_index()
+    daily     = pd.read_excel(FRED_PATH, sheet_name="일간데이터",
+                               index_col=0, parse_dates=True).sort_index()
+    if "금현물가격(USD/oz)" in daily.columns and "금현물가격" not in daily.columns:
+        daily = daily.rename(columns={"금현물가격(USD/oz)": "금현물가격"})
+    monthly   = pd.read_excel(FRED_PATH, sheet_name="월간데이터",
+                               index_col=0, parse_dates=True).sort_index()
+    regime_daily = regime_df.reindex(daily.index, method="ffill")
+    prob_daily   = prob_df.reindex(daily.index, method="ffill")
+    monthly_d    = monthly.reindex(daily.index, method="ffill")
+    fred = pd.concat([daily, monthly_d], axis=1)
+    df   = regime_daily.join(fred, how="left", rsuffix="_fred")
+    df   = df.join(prob_daily, how="left", rsuffix="_prob")
+    df   = df.ffill().bfill()
+    return df
+
+
+def add_regime_backgrounds(fig, df, row):
+    regimes = df["국면"]
+    current = regimes.iloc[0]
+    start   = df.index[0]
+    for i in range(1, len(df)):
+        if regimes.iloc[i] != current or i == len(df) - 1:
+            end   = df.index[i]
+            color = REGIME_COLORS.get(current, "rgba(200,200,200,0.12)")
+            if row is None:
+                fig.add_vrect(x0=start, x1=end, fillcolor=color,
+                              layer="below", line_width=0)
+            else:
+                fig.add_vrect(x0=start, x1=end, fillcolor=color,
+                              layer="below", line_width=0, row=row, col=1)
+            current = regimes.iloc[i]
+            start   = df.index[i]
+
+
+def build_dashboard(df: pd.DataFrame, idx_df: pd.DataFrame) -> go.Figure:
+    """상단 차트: 시장 지표 오버레이 (단독 Figure)"""
+    from plotly.subplots import make_subplots as _msp
+    fig = _msp(rows=1, cols=1, specs=[[{"secondary_y": True}]])
+
+    latest = df.index[-1]
+    add_regime_backgrounds(fig, df, row=1)
+
+    CRISIS_LINE_COLOR = "rgba(255,255,255,0.55)"
+    for start, end, label, color in CRISIS_PERIODS:
+        end_ts   = latest if end is None else pd.Timestamp(end)
+        start_ts = pd.Timestamp(start)
+        is_current = (end is None)
+        fig.add_shape(
+            type="line", x0=start_ts, x1=start_ts, y0=0, y1=1,
+            xref="x", yref="y domain", layer="above",
+            line=dict(color=CRISIS_LINE_COLOR, width=1.5, dash="solid"),
+        )
+        if not is_current:
+            fig.add_shape(
+                type="line", x0=end_ts, x1=end_ts, y0=0, y1=1,
+                xref="x", yref="y domain", layer="above",
+                line=dict(color=CRISIS_LINE_COLOR, width=1.0, dash="dot"),
+            )
+        fig.add_annotation(
+            x=start_ts, y=0.995, yref="paper",
+            text=f"<b>{label}</b>", showarrow=False,
+            font=dict(size=9, color=color, family="Malgun Gothic"),
+            xanchor="left", yanchor="top", textangle=-90,
+        )
+
+    for col_key, name, source, right_axis, color, visible, _ in OVERLAY_SERIES:
+        s = idx_df[col_key] if source == "index" else df.get(col_key)
+        if s is None or (hasattr(s, "empty") and s.empty):
+            continue
+        s = s.dropna()
+        if s.empty:
+            continue
+        fmt  = ".2f" if right_axis else ",.1f"
+        unit = "%" if right_axis and col_key not in ("VIX", "M2통화량", "ISM제조업PMI") else ""
+        fig.add_trace(go.Scatter(
+            x=s.index, y=s.values, name=name,
+            line=dict(color=color, width=1.5),
+            visible=True if visible else False,
+            hovertemplate=f"<b>{name}</b>: %{{y:{fmt}}}{unit}<extra></extra>",
+            showlegend=False,
+        ), row=1, col=1, secondary_y=right_axis)
+
+    for i, (regime, color) in enumerate(REGIME_LINE_COLORS.items()):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="markers",
+            marker=dict(size=11, color=color, symbol="square"),
+            name=regime, legendgroup="regime",
+            legendgrouptitle=dict(text="국면") if i == 0 else None,
+            showlegend=True,
+            hoverinfo="skip",
+        ), row=1, col=1)
+
+    fig.update_layout(
+        title=dict(text="<b>시장 국면 판단 대시보드</b>",
+                   font=dict(size=20, family="Malgun Gothic", color="white"), x=0.5,
+                   y=0.99, yanchor="top"),
+        template="plotly_dark",
+        height=560, hovermode="x unified",
+        dragmode="pan", autosize=True,
+        margin=dict(l=60, r=200, t=60, b=40),
+        legend=dict(orientation="v", x=1.02, y=1.0,
+                    xanchor="left", yanchor="top",
+                    font=dict(size=11, color="white"),
+                    bgcolor="rgba(0,0,0,0.4)",
+                    bordercolor="rgba(255,255,255,0.2)", borderwidth=1),
+        xaxis=dict(
+            type="date",
+            rangeselector=dict(
+                buttons=[
+                    dict(count=1,  label="1Y", step="year",  stepmode="backward"),
+                    dict(count=3,  label="3Y", step="year",  stepmode="backward"),
+                    dict(count=5,  label="5Y", step="year",  stepmode="backward"),
+                    dict(count=10, label="10Y",step="year",  stepmode="backward"),
+                    dict(step="all", label="전체"),
+                ],
+                bgcolor="rgba(0,0,0,0.5)",
+                activecolor="#3498db",
+                font=dict(size=11, color="white"),
+            ),
+            rangeslider=dict(visible=True, thickness=0.05),
+        ),
+        font=dict(family="Malgun Gothic"),
+    )
+    fig.update_yaxes(title_text="가격 / 지수", row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="금리 / 지표", row=1, col=1, secondary_y=True, showgrid=False)
+
+    # ── 학습 / 추론 경계선 ─────────────────────────────────
+    infer_ts = pd.Timestamp(INFER_START_DATE)
+    fig.add_shape(
+        type="line", x0=infer_ts, x1=infer_ts, y0=0, y1=1,
+        xref="x", yref="y domain", layer="above",
+        line=dict(color="rgba(255,255,255,0.75)", width=2, dash="dashdot"),
+    )
+    fig.add_annotation(
+        x=infer_ts, y=0.50, yref="paper",
+        text="<b>학습 ◀│▶ 추론</b>",
+        showarrow=False,
+        font=dict(size=9, color="rgba(255,255,255,0.8)", family="Malgun Gothic"),
+        xanchor="center", yanchor="middle", textangle=-90,
+        bgcolor="rgba(30,30,50,0.75)",
+        bordercolor="rgba(255,255,255,0.35)", borderwidth=1,
+    )
+    return fig
+
+
+def build_prob_chart(df: pd.DataFrame) -> go.Figure:
+    """하단 차트: 국면 확률 (단독 Figure, 호버 독립)"""
+    fig = go.Figure()
+
+    add_regime_backgrounds(fig, df, row=None)
+
+    for regime, color in zip(PROB_REGIMES, PROB_COLORS):
+        col_match = [c for c in df.columns
+                     if regime in c and "prob" not in c.lower() and c != "국면"]
+        if not col_match:
+            col_match = [c for c in df.columns if regime == c]
+        if col_match:
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df[col_match[0]] * 100,
+                mode="lines", name=regime,
+                stackgroup="prob", line=dict(width=0),
+                fillcolor=color, showlegend=True,
+                legendgroup="prob",
+                hovertemplate=f"<b>{regime}</b>: %{{y:.1f}}%<extra></extra>",
+            ))
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=260, hovermode="x unified",
+        dragmode="pan", autosize=True,
+        margin=dict(l=60, r=200, t=30, b=40),
+        legend=dict(orientation="v", x=1.02, y=1.0,
+                    xanchor="left", yanchor="top",
+                    font=dict(size=11, color="white"),
+                    bgcolor="rgba(0,0,0,0.4)",
+                    bordercolor="rgba(255,255,255,0.2)", borderwidth=1),
+        xaxis=dict(type="date"),
+        yaxis=dict(title="확률 (%)", range=[0, 100], fixedrange=True),
+        font=dict(family="Malgun Gothic"),
+        annotations=[dict(
+            text="국면 확률", x=0.0, xref="paper", y=1.04, yref="paper",
+            showarrow=False, xanchor="left",
+            font=dict(size=15, family="Malgun Gothic", color="rgba(255,255,255,0.9)"),
+        )],
+    )
+
+    # ── 학습 / 추론 경계선 ─────────────────────────────────
+    infer_ts = pd.Timestamp(INFER_START_DATE)
+    fig.add_shape(
+        type="line", x0=infer_ts, x1=infer_ts, y0=0, y1=1,
+        xref="x", yref="y domain", layer="above",
+        line=dict(color="rgba(255,255,255,0.75)", width=2, dash="dashdot"),
+    )
+    fig.add_annotation(
+        x=infer_ts, y=0.50, yref="paper",
+        text="<b>학습 ◀│▶ 추론</b>",
+        showarrow=False,
+        font=dict(size=9, color="rgba(255,255,255,0.8)", family="Malgun Gothic"),
+        xanchor="center", yanchor="middle", textangle=-90,
+        bgcolor="rgba(30,30,50,0.75)",
+        bordercolor="rgba(255,255,255,0.35)", borderwidth=1,
+    )
+    return fig
+
+
+def _build_html_body(chart_html: str, df: pd.DataFrame,
+                     idx_df: pd.DataFrame, wrapper_height: str) -> str:
+    groups = OrderedDict()
+    for _, name, _, right_axis, color, visible, group in OVERLAY_SERIES:
+        groups.setdefault(group, []).append((name, color, visible, right_axis))
+
+    cb_sections = ""
+    for group_name, items in groups.items():
+        items_html = ""
+        for name, color, visible, right_axis in items:
+            checked    = "checked" if visible else ""
+            safe_id    = (name.replace(" ", "_").replace("(", "")
+                              .replace(")", "").replace("/", "_"))
+            active_cls = "active" if right_axis else ""
+            btn_txt    = "우✓" if right_axis else "우"
+            items_html += f"""
+      <label class="cb-label">
+        <input type="checkbox" id="cb_{safe_id}" {checked}
+          onchange="toggleSeries(this,'{name}')">
+        <span class="cb-dot" style="background:{color}"></span>
+        <span class="cb-name">{name}</span>
+        <button class="btn-yaxis-item {active_cls}" data-trace="{name}"
+          onclick="toggleSeriesAxis(this,'{name}');event.stopPropagation();"
+          title="우측 축 전환">{btn_txt}</button>
+      </label>"""
+        cb_sections += f"""
+    <div class="cb-group">
+      <div class="cb-group-title"><span>{group_name}</span></div>{items_html}
+    </div>"""
+
+    defaults_items = []
+    for _, name, _, _, _, visible, _ in OVERLAY_SERIES:
+        escaped = name.replace("'", "\\'")
+        defaults_items.append(f"  '{escaped}': {'true' if visible else 'false'}")
+    defaults_js = "{\n" + ",\n".join(defaults_items) + "\n}"
+
+    axis_defaults = {name: ra for _, name, _, ra, _, _, _ in OVERLAY_SERIES}
+    axis_defaults_json = json.dumps(axis_defaults)
+
+    prob_cols = {}
+    for regime in PROB_REGIMES:
+        col_match = [c for c in df.columns
+                     if regime in c and "prob" not in c.lower() and c != "국면"]
+        if not col_match:
+            col_match = [c for c in df.columns if regime == c]
+        if col_match:
+            prob_cols[regime] = df[col_match[0]]
+
+    prob_json_rows = []
+    if prob_cols:
+        for dt in list(prob_cols.values())[0].index:
+            ds = dt.strftime("%Y-%m-%d")
+            row = {"d": ds}
+            for regime, s in prob_cols.items():
+                row[regime] = round(float(s.get(dt, 0)) * 100, 1)
+            prob_json_rows.append(row)
+    prob_json = json.dumps(prob_json_rows)
+
+    perf_assets = {}
+    for col_key, name, source, right_axis, _, _, _ in OVERLAY_SERIES:
+        if right_axis:
+            continue
+        s = idx_df[col_key] if source == "index" else df.get(col_key)
+        if s is None or (hasattr(s, "empty") and s.empty):
+            continue
+        s = s.dropna()
+        if s.empty:
+            continue
+        perf_assets[name] = [{"d": dt.strftime("%Y-%m-%d"), "v": round(float(v), 4)}
+                              for dt, v in s.items()]
+    perf_assets_json = json.dumps(perf_assets)
+
+    sp500_s = idx_df["SP500"].dropna() if "SP500" in idx_df.columns else pd.Series()
+    sp500_json = json.dumps([{"d": dt.strftime("%Y-%m-%d"), "v": round(float(v), 2)}
+                              for dt, v in sp500_s.items()])
+
+    data_start = df.index[0].strftime("%Y-%m-%d")
+    data_end   = df.index[-1].strftime("%Y-%m-%d")
+
+    latest_str = df.index[-1].strftime("%Y-%m-%d")
+    crisis_hover_list = []
+    for start, end, label, color in CRISIS_PERIODS:
+        end_str = latest_str if end is None else end
+        info    = CRISIS_HOVER_INFO.get(label, {})
+        crisis_hover_list.append({
+            "label":      label,
+            "title":      info.get("title", label),
+            "period":     info.get("period", f"{start[:7]} ~ {end_str[:7]}"),
+            "start":      start,
+            "end":        end_str,
+            "color":      color,
+            "indicators": info.get("indicators", []),
+            "note":       info.get("note", ""),
+        })
+    crisis_hover_json = json.dumps(crisis_hover_list, ensure_ascii=False)
+
+    return f"""<style>
+*, *::before, *::after {{ box-sizing: border-box; }}
+html {{ margin:0; padding:0; width:100%; height:100%;
+  background:#111; font-family:'Malgun Gothic',Arial,sans-serif; color:white; }}
+body {{ margin:0; padding:0; background:#111; }}
+#wrapper {{ display:flex; height:{wrapper_height}; width:100%; }}
+#sidebar {{
+  width:264px; min-width:264px; background:#1a1a2e;
+  border-right:1px solid #2c3e50;
+  display:flex; flex-direction:column; flex-shrink:0;
+}}
+.sb-tabs {{ display:flex; border-bottom:1px solid #2c3e50; }}
+.sb-tab {{
+  flex:1; padding:9px 4px; text-align:center; cursor:pointer; font-size:11px;
+  color:rgba(255,255,255,0.5); border:none; background:none;
+  font-family:'Malgun Gothic',Arial,sans-serif;
+  border-bottom:2px solid transparent; transition:all 0.15s;
+}}
+.sb-tab.active {{ color:white; border-bottom-color:#3498db; }}
+.sb-panel {{ display:none; flex:1; overflow-y:auto; padding:10px; }}
+.sb-panel.active {{ display:block; }}
+.btn-action {{
+  width:100%; padding:7px 6px; margin-bottom:8px;
+  background:rgba(52,152,219,0.25); border:1px solid #3498db;
+  color:white; border-radius:5px; cursor:pointer; font-size:11px;
+  font-family:'Malgun Gothic',Arial,sans-serif; transition:background 0.15s;
+}}
+.btn-action:hover {{ background:rgba(52,152,219,0.5); }}
+.btn-reset {{
+  width:100%; padding:7px 6px; margin-bottom:10px;
+  background:rgba(255,255,255,0.07); border:1px solid rgba(255,255,255,0.15);
+  color:rgba(255,255,255,0.7); border-radius:5px; cursor:pointer; font-size:11px;
+  font-family:'Malgun Gothic',Arial,sans-serif; transition:background 0.15s;
+}}
+.btn-reset:hover {{ background:rgba(255,255,255,0.15); color:white; }}
+.cb-group {{ margin-bottom:12px; }}
+.cb-group-title {{
+  font-size:11px; font-weight:bold; color:rgba(255,255,255,0.85);
+  margin-bottom:4px; padding:4px 6px;
+  background:rgba(255,255,255,0.06); border-radius:4px;
+}}
+.cb-label {{
+  display:flex; align-items:center; gap:5px; cursor:pointer;
+  padding:3px 5px; border-radius:4px; font-size:12px;
+  color:rgba(255,255,255,0.7); margin-bottom:1px;
+  transition:background 0.12s;
+}}
+.cb-label:hover {{ background:rgba(255,255,255,0.08); color:white; }}
+.cb-label input {{ width:13px; height:13px; cursor:pointer; accent-color:#3498db; flex-shrink:0; }}
+.cb-dot {{ width:9px; height:9px; border-radius:50%; flex-shrink:0; }}
+.cb-name {{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+.btn-yaxis-item {{
+  font-size:8px; padding:1px 5px; cursor:pointer;
+  background:transparent; border:1px solid rgba(255,165,0,0.35);
+  color:rgba(255,165,0,0.7); border-radius:3px;
+  font-family:'Malgun Gothic',Arial,sans-serif; flex-shrink:0;
+  transition:all 0.12s; white-space:nowrap;
+}}
+.btn-yaxis-item:hover {{ background:rgba(255,165,0,0.3); color:white; }}
+.btn-yaxis-item.active {{ background:rgba(255,165,0,0.55); color:white; border-color:#ffa500; }}
+.period-section {{ margin-bottom:14px; }}
+.period-label {{
+  font-size:10px; color:rgba(255,255,255,0.5); margin-bottom:4px;
+  text-transform:uppercase; letter-spacing:0.5px;
+}}
+.date-input {{
+  width:100%; padding:5px 7px; background:rgba(255,255,255,0.08);
+  border:1px solid rgba(255,255,255,0.2); border-radius:4px;
+  color:white; font-size:12px; margin-bottom:5px;
+  font-family:'Malgun Gothic',Arial,sans-serif;
+}}
+.date-input:focus {{ outline:none; border-color:#3498db; }}
+.quick-btns {{ display:flex; gap:3px; flex-wrap:wrap; margin-bottom:8px; }}
+.qbtn {{
+  padding:3px 8px; font-size:10px; cursor:pointer;
+  background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.2);
+  color:rgba(255,255,255,0.7); border-radius:3px;
+  font-family:'Malgun Gothic',Arial,sans-serif; transition:background 0.12s;
+}}
+.qbtn:hover {{ background:rgba(255,255,255,0.2); color:white; }}
+.asset-select {{
+  width:100%; padding:5px 7px; background:rgba(255,255,255,0.08);
+  border:1px solid rgba(255,255,255,0.2); border-radius:4px;
+  color:white; font-size:12px; margin-bottom:6px;
+  font-family:'Malgun Gothic',Arial,sans-serif; cursor:pointer;
+}}
+.asset-select:focus {{ outline:none; border-color:#3498db; }}
+.asset-select option {{ background:#1a1a2e; color:white; }}
+.perf-table {{ width:100%; border-collapse:collapse; font-size:10px; margin-top:6px; }}
+.perf-table th {{
+  background:rgba(255,255,255,0.1); padding:4px 3px; text-align:center;
+  font-weight:bold; border-bottom:1px solid rgba(255,255,255,0.2); font-size:9px;
+}}
+.perf-table td {{
+  padding:3px 3px; text-align:right;
+  border-bottom:1px solid rgba(255,255,255,0.06); font-size:10px;
+}}
+.perf-table td:first-child {{ text-align:left; color:rgba(255,255,255,0.8); }}
+.pos {{ color:#2ecc71; }} .neg {{ color:#e74c3c; }} .na {{ color:rgba(255,255,255,0.3); }}
+.lookup-result {{
+  background:rgba(255,255,255,0.05); border-radius:6px;
+  padding:8px; margin-top:8px; font-size:11px;
+}}
+.lookup-result .regime-row {{
+  display:flex; justify-content:space-between; padding:2px 0;
+  border-bottom:1px solid rgba(255,255,255,0.06);
+}}
+.fwd-table {{ width:100%; border-collapse:collapse; font-size:10px; margin-top:6px; }}
+.fwd-table th {{
+  background:rgba(255,255,255,0.1); padding:4px 3px; text-align:center;
+  font-size:9px; border-bottom:1px solid rgba(255,255,255,0.2);
+}}
+.fwd-table td {{
+  padding:3px; text-align:center; font-size:10px;
+  border-bottom:1px solid rgba(255,255,255,0.06);
+}}
+.divider {{ border-top:1px solid rgba(255,255,255,0.1); margin:10px 0; }}
+#crisis-tip {{
+  display:none; position:fixed; z-index:9999;
+  background:#1a2535; border:1px solid rgba(255,255,255,0.18);
+  border-radius:10px; padding:14px 18px; max-width:290px; min-width:220px;
+  pointer-events:none; font-family:'Malgun Gothic',Arial,sans-serif;
+  box-shadow:0 6px 28px rgba(0,0,0,0.65);
+}}
+#chart-area {{ flex:1; overflow:auto; min-width:0; }}
+#chart-area .plotly-graph-div {{ width:100% !important; }}
+#chart-main {{ width:100%; }}
+#chart-prob  {{ width:100%; margin-top:4px; }}
+</style>
+
+<div id="crisis-tip"></div>
+<div id="wrapper">
+<div id="sidebar">
+  <div class="sb-tabs">
+    <button class="sb-tab active" onclick="switchTab('indicators',this)">📡 지표선택</button>
+    <button class="sb-tab"       onclick="switchTab('period',this)">📅 기간분석</button>
+  </div>
+  <div id="tab-indicators" class="sb-panel active">
+    <button class="btn-reset" onclick="resetAll()">↺ 기본값 초기화</button>
+    {cb_sections}
+  </div>
+  <div id="tab-period" class="sb-panel">
+    <div class="period-section">
+      <div class="period-label">📆 기간 설정</div>
+      <input type="date" id="inp-start" class="date-input" value="{data_start}">
+      <input type="date" id="inp-end"   class="date-input" value="{data_end}">
+      <div class="quick-btns">
+        <button class="qbtn" onclick="setQuickPeriod(1)">1Y</button>
+        <button class="qbtn" onclick="setQuickPeriod(3)">3Y</button>
+        <button class="qbtn" onclick="setQuickPeriod(5)">5Y</button>
+        <button class="qbtn" onclick="setQuickPeriod(10)">10Y</button>
+        <button class="qbtn" onclick="setQuickPeriod(0)">전체</button>
+      </div>
+      <button class="btn-action" onclick="applyPeriod()">▶ 기간 적용 + 성과 계산</button>
+    </div>
+    <div class="period-label" style="margin-top:4px">📊 성과 기준 자산</div>
+    <select id="perf-asset-select" class="asset-select" onchange="onAssetChange()">
+      <option value="S&P 500" selected>S&P 500</option>
+    </select>
+    <div id="perf-section" style="display:none;">
+      <div class="period-label" id="perf-section-label">📊 기간별 성과</div>
+      <table class="perf-table" id="perf-table">
+        <thead><tr>
+          <th>기간</th><th>수익률</th><th>최고</th><th>최저</th><th>MDD</th>
+        </tr></thead>
+        <tbody id="perf-tbody"></tbody>
+      </table>
+    </div>
+    <div class="divider"></div>
+    <div class="period-section">
+      <div class="period-label">🔍 국면 조회 (날짜 입력)</div>
+      <input type="date" id="inp-lookup" class="date-input" value="{data_end}">
+      <button class="btn-action" onclick="lookupRegime()">▶ 국면 조회 + 유사 시점 분석</button>
+    </div>
+    <div id="lookup-result" style="display:none;"></div>
+  </div>
+</div>
+<div id="chart-area">
+  <div id="chart-main">{chart_html}</div>
+</div>
+</div>
+
+<script>
+function getGd() {{
+  // 상단 시장 지표 차트 (첫 번째 Figure)
+  var divs = document.querySelectorAll('#chart-main .plotly-graph-div');
+  return divs.length ? divs[0] : document.querySelector('#chart-area .plotly-graph-div');
+}}
+function switchTab(id, btn) {{
+  document.querySelectorAll('.sb-tab').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.sb-panel').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('tab-' + id).classList.add('active');
+}}
+window.addEventListener('load', function() {{
+  var gd = getGd();
+  if (gd) Plotly.relayout(gd, {{autosize: true}});
+  initCrisisHover();
+}});
+
+function toggleSeries(cb, traceName) {{
+  var gd = getGd(); if (!gd) return;
+  var idx = [];
+  gd.data.forEach(function(t, i) {{ if (t.name === traceName) idx.push(i); }});
+  if (idx.length) Plotly.restyle(gd, {{visible: cb.checked}}, idx);
+}}
+
+var DEFAULTS      = {defaults_js};
+var AXIS_DEFAULTS = {axis_defaults_json};
+var seriesAxisState = Object.assign({{}}, AXIS_DEFAULTS);
+
+function toggleSeriesAxis(btn, traceName) {{
+  var gd = getGd(); if (!gd) return;
+  var isRight = !seriesAxisState[traceName];
+  seriesAxisState[traceName] = isRight;
+  btn.classList.toggle('active', isRight);
+  btn.textContent = isRight ? '우✓' : '우';
+  var idx = [];
+  gd.data.forEach(function(t, i) {{
+    if (t.name === traceName) idx.push(i);
+  }});
+  if (idx.length) {{
+    Plotly.restyle(gd, {{'yaxis': isRight ? 'y2' : 'y'}}, idx);
+  }}
+}}
+
+function resetAll() {{
+  var gd = getGd(); if (!gd) return;
+  gd.data.forEach(function(t, i) {{
+    if (t.name in DEFAULTS) {{
+      Plotly.restyle(gd, {{visible: DEFAULTS[t.name]}}, [i]);
+      var sid = 'cb_' + t.name.replace(/ /g,'_').replace(/[()\\/ ]/g,'');
+      var el = document.getElementById(sid);
+      if (el) el.checked = DEFAULTS[t.name];
+    }}
+  }});
+  gd.data.forEach(function(t, i) {{
+    if (t.name in AXIS_DEFAULTS) {{
+      Plotly.restyle(gd, {{'yaxis': AXIS_DEFAULTS[t.name] ? 'y2' : 'y'}}, [i]);
+    }}
+  }});
+  seriesAxisState = Object.assign({{}}, AXIS_DEFAULTS);
+  document.querySelectorAll('.btn-yaxis-item').forEach(function(btn) {{
+    var tn = btn.getAttribute('data-trace'); if (!tn) return;
+    var ir = AXIS_DEFAULTS[tn];
+    btn.classList.toggle('active', !!ir);
+    btn.textContent = ir ? '우✓' : '우';
+  }});
+}}
+
+var CRISIS_HOVER_DATA = {crisis_hover_json};
+
+function initCrisisHover() {{
+  var gd  = getGd(); if (!gd) return;
+  var tip = document.getElementById('crisis-tip');
+  CRISIS_HOVER_DATA.forEach(function(c) {{
+    c.startMs = new Date(c.start).getTime();
+    c.endMs   = new Date(c.end).getTime();
+  }});
+  gd.on('plotly_hover', function(data) {{
+    if (!data.points || !data.points.length) return;
+    var xMs  = new Date(data.points[0].x).getTime();
+    var evt  = data.event;
+    var found = null;
+    for (var i = 0; i < CRISIS_HOVER_DATA.length; i++) {{
+      var c = CRISIS_HOVER_DATA[i];
+      if (xMs >= c.startMs && xMs <= c.endMs) {{ found = c; break; }}
+    }}
+    if (!found) {{ tip.style.display = 'none'; return; }}
+    var html = '<div style="font-weight:bold;font-size:13px;color:' + found.color
+      + ';margin-bottom:4px">📌 ' + found.title + '</div>'
+      + '<div style="font-size:10px;color:rgba(255,255,255,0.45);margin-bottom:10px">'
+      + found.period + '</div>';
+    found.indicators.forEach(function(ind) {{
+      html += '<div style="display:flex;justify-content:space-between;margin-bottom:4px;line-height:1.4">'
+        + '<span style="color:rgba(255,255,255,0.6);flex-shrink:0;margin-right:10px">'
+        + ind[0] + '</span>'
+        + '<span style="color:#ecf0f1;text-align:right">' + ind[1] + '</span>'
+        + '</div>';
+    }});
+    if (found.note) {{
+      html += '<div style="margin-top:9px;padding-top:9px;'
+        + 'border-top:1px solid rgba(255,255,255,0.12);'
+        + 'color:rgba(255,255,255,0.55);font-size:11px;line-height:1.5">'
+        + found.note + '</div>';
+    }}
+    tip.innerHTML = html;
+    var tw = 290, th = 200;
+    var cx = evt.clientX + 16, cy = evt.clientY - 20;
+    if (cx + tw > window.innerWidth  - 10) cx = evt.clientX - tw - 10;
+    if (cy + th > window.innerHeight - 10) cy = window.innerHeight - th - 10;
+    tip.style.left    = cx + 'px';
+    tip.style.top     = cy + 'px';
+    tip.style.display = 'block';
+  }});
+  gd.on('plotly_unhover', function() {{
+    tip.style.display = 'none';
+  }});
+}}
+
+var PERF_ASSETS = {perf_assets_json};
+
+(function() {{
+  var sel = document.getElementById('perf-asset-select');
+  Object.keys(PERF_ASSETS).forEach(function(name) {{
+    if (name === 'S&P 500') return;
+    var opt = document.createElement('option');
+    opt.value = name; opt.textContent = name;
+    sel.appendChild(opt);
+  }});
+}})();
+
+var activeAssetMap = {{}}, activeAssetDates = [];
+function buildAssetMap(name) {{
+  activeAssetMap = {{}};
+  var data = PERF_ASSETS[name] || [];
+  data.forEach(function(r) {{ activeAssetMap[r.d] = r.v; }});
+  activeAssetDates = data.map(function(r) {{ return r.d; }});
+}}
+buildAssetMap('S&P 500');
+
+function onAssetChange() {{
+  var name = document.getElementById('perf-asset-select').value;
+  buildAssetMap(name);
+  if (document.getElementById('perf-section').style.display !== 'none') applyPeriod();
+}}
+
+var SP500_DATA = {sp500_json};
+var sp500Map = {{}};
+SP500_DATA.forEach(function(r) {{ sp500Map[r.d] = r.v; }});
+var sp500Dates = SP500_DATA.map(function(r) {{ return r.d; }});
+
+var PROB_DATA = {prob_json};
+var probMap = {{}};
+PROB_DATA.forEach(function(r) {{ probMap[r.d] = r; }});
+var probDates = PROB_DATA.map(function(r) {{ return r.d; }});
+
+function addMonths(dateStr, months) {{
+  var d = new Date(dateStr); d.setMonth(d.getMonth() + months);
+  return d.toISOString().slice(0, 10);
+}}
+function addYears(dateStr, years) {{
+  var d = new Date(dateStr); d.setFullYear(d.getFullYear() + years);
+  return d.toISOString().slice(0, 10);
+}}
+function findNearest(dates, target) {{
+  var tMs = new Date(target).getTime();
+  var best = null, bestDiff = Infinity;
+  dates.forEach(function(d) {{
+    var diff = Math.abs(new Date(d).getTime() - tMs);
+    if (diff < bestDiff) {{ bestDiff = diff; best = d; }}
+  }});
+  return best;
+}}
+function getPrice(dateStr) {{
+  var d = findNearest(activeAssetDates, dateStr);
+  return d ? activeAssetMap[d] : null;
+}}
+function calcMDD(start, end) {{
+  var peak = -Infinity, mdd = 0;
+  activeAssetDates.forEach(function(d) {{
+    if (d < start || d > end) return;
+    var v = activeAssetMap[d]; if (!v) return;
+    if (v > peak) peak = v;
+    var dd = (v - peak) / peak * 100;
+    if (dd < mdd) mdd = dd;
+  }});
+  return mdd;
+}}
+function fmtRet(val) {{
+  if (val === null || isNaN(val)) return '<span class="na">N/A</span>';
+  var cls = val >= 0 ? 'pos' : 'neg';
+  return '<span class="' + cls + '">' + (val >= 0 ? '+' : '') + val.toFixed(1) + '%</span>';
+}}
+function setQuickPeriod(years) {{
+  var endDate = sp500Dates[sp500Dates.length - 1];
+  document.getElementById('inp-end').value = endDate;
+  document.getElementById('inp-start').value =
+    years === 0 ? sp500Dates[0] : addYears(endDate, -years);
+}}
+function applyPeriod() {{
+  var start = document.getElementById('inp-start').value;
+  var end   = document.getElementById('inp-end').value;
+  if (!start || !end) return;
+  Plotly.relayout(getGd(), {{'xaxis.range': [start, end]}});
+  buildAssetMap(document.getElementById('perf-asset-select').value);
+  var horizons = [
+    ['1M',addMonths(end,-1),end],['3M',addMonths(end,-3),end],
+    ['6M',addMonths(end,-6),end],['1Y',addYears(end,-1),end],
+    ['2Y',addYears(end,-2),end],['3Y',addYears(end,-3),end],
+    ['설정기간',start,end],
+  ];
+  var rows = '';
+  horizons.forEach(function(h) {{
+    var label=h[0], s=h[1], e=h[2];
+    var ps=getPrice(s), pe=getPrice(e);
+    var ret=(ps&&pe)?(pe-ps)/ps*100:null;
+    var hi=null, lo=null;
+    activeAssetDates.forEach(function(d) {{
+      if(d<s||d>e) return; var v=activeAssetMap[d]; if(!v) return;
+      if(hi===null||v>hi) hi=v; if(lo===null||v<lo) lo=v;
+    }});
+    rows += '<tr><td>'+label+'</td><td>'+fmtRet(ret)+'</td>'
+      +'<td>'+fmtRet((ps&&hi)?(hi-ps)/ps*100:null)+'</td>'
+      +'<td>'+fmtRet((ps&&lo)?(lo-ps)/ps*100:null)+'</td>'
+      +'<td>'+fmtRet(calcMDD(s,e))+'</td></tr>';
+  }});
+  document.getElementById('perf-tbody').innerHTML = rows;
+  document.getElementById('perf-section-label').textContent =
+    '📊 ' + document.getElementById('perf-asset-select').value + ' 기간별 성과';
+  document.getElementById('perf-section').style.display = 'block';
+}}
+
+var PROB_REGIMES_DASH = {json.dumps(PROB_REGIMES)};
+var PROB_COLORS_DASH  = {json.dumps(PROB_COLORS)};
+
+function cosineSim(a, b) {{
+  var dot=0, na=0, nb=0;
+  for (var i=0;i<a.length;i++) {{ dot+=a[i]*b[i]; na+=a[i]*a[i]; nb+=b[i]*b[i]; }}
+  var d=Math.sqrt(na)*Math.sqrt(nb); return d>0?dot/d:0;
+}}
+function lookupRegime() {{
+  var dateStr = document.getElementById('inp-lookup').value; if (!dateStr) return;
+  var nearest = findNearest(probDates, dateStr);
+  if (!nearest) {{
+    document.getElementById('lookup-result').innerHTML='<div class="lookup-result">데이터 없음</div>';
+    return;
+  }}
+  var probRow  = probMap[nearest];
+  var queryVec = PROB_REGIMES_DASH.map(function(r) {{ return probRow[r]||0; }});
+  var regimeHtml = '<div style="font-size:10px;color:rgba(255,255,255,0.5);margin-bottom:6px">기준일: '+nearest+'</div>';
+  PROB_REGIMES_DASH.forEach(function(r, i) {{
+    var v=(probRow[r]||0).toFixed(1);
+    var bar=Math.round((probRow[r]||0)/100*80);
+    regimeHtml+='<div class="regime-row"><span style="color:'+PROB_COLORS_DASH[i]+'">'+r+'</span>'
+      +'<span><span style="display:inline-block;width:'+bar+'px;height:6px;background:'
+      +PROB_COLORS_DASH[i]+';border-radius:3px;margin-right:4px;vertical-align:middle"></span>'
+      +v+'%</span></div>';
+  }});
+  var queryMs=new Date(nearest).getTime();
+  var similar=[];
+  probDates.forEach(function(d) {{
+    if(Math.abs(new Date(d).getTime()-queryMs)<180*24*3600*1000) return;
+    similar.push({{d:d, sim:cosineSim(queryVec, PROB_REGIMES_DASH.map(function(r){{return probMap[d][r]||0;}}))}});
+  }});
+  similar.sort(function(a,b){{return b.sim-a.sim;}});
+  var top=similar.slice(0,60);
+  var fwdHtml='<div style="font-size:10px;color:rgba(255,255,255,0.5);margin:8px 0 4px">유사 시점 '+top.length+'개 기준 S&P 500 전진 성과</div>';
+  fwdHtml+='<table class="fwd-table"><thead><tr><th>기간</th><th>상승</th><th>하락</th><th>평균수익률</th></tr></thead><tbody>';
+  [['1M',1],['3M',3],['6M',6],['1Y',12]].forEach(function(h) {{
+    var label=h[0], months=h[1], up=0, dn=0, sum=0, cnt=0;
+    top.forEach(function(item) {{
+      var p0=getPrice(item.d), p1=getPrice(addMonths(item.d,months));
+      if(!p0||!p1) return;
+      var ret=(p1-p0)/p0*100;
+      if(ret>=0) up++; else dn++; sum+=ret; cnt++;
+    }});
+    var tot=up+dn;
+    fwdHtml+='<tr><td>'+label+'</td>'
+      +'<td><span class="pos">'+(tot>0?(up/tot*100).toFixed(0):'N/A')+'%</span></td>'
+      +'<td><span class="neg">'+(tot>0?(dn/tot*100).toFixed(0):'N/A')+'%</span></td>'
+      +'<td>'+(cnt>0?fmtRet(sum/cnt):'<span class="na">N/A</span>')+'</td></tr>';
+  }});
+  fwdHtml+='</tbody></table>';
+  var el=document.getElementById('lookup-result');
+  el.innerHTML='<div class="lookup-result">'+regimeHtml+'<div class="divider"></div>'+fwdHtml+'</div>';
+  el.style.display='block';
+}}
+</script>"""
+
+
+def get_tab_embed_html(df: pd.DataFrame, idx_df: pd.DataFrame) -> str:
+    """시각화_03 탭 통합용 HTML 프래그먼트 (include_plotlyjs=False)"""
+    cfg = {"scrollZoom": True, "displayModeBar": True, "responsive": True}
+    cfg_prob = {"scrollZoom": False, "displayModeBar": False, "responsive": True}
+
+    fig_main = build_dashboard(df, idx_df)
+    fig_prob = build_prob_chart(df)
+
+    chart_html = fig_main.to_html(full_html=False, include_plotlyjs=False, config=cfg)
+    prob_html  = fig_prob.to_html(full_html=False, include_plotlyjs=False, config=cfg_prob)
+
+    # 상단 차트 + 하단 국면확률 차트를 id 구분하여 전달
+    combined_chart_html = (
+        chart_html +
+        '<div id="chart-prob">' + prob_html + '</div>'
+    )
+    return _build_html_body(combined_chart_html, df, idx_df, "100%")
+
+# ═══════════════════════════════════════════════════════════
+# ▲▲▲  시각화_02 통합 함수 끝  ▲▲▲
+# ═══════════════════════════════════════════════════════════
+
+
+# =====================================
+# 위기 구간별 수익률 / MDD 계산
+# =====================================
+def calc_mdd(series: pd.Series) -> float:
+    s = series.dropna()
+    if s.empty:
+        return np.nan
+    peak = s.cummax()
+    return ((s - peak) / peak * 100).min()
+
+
+def calc_crisis_heatmap_data(assets_df: pd.DataFrame):
+    """CRISIS_PERIODS_COMP 기준으로 위기 구간 × 자산 수익률/MDD 행렬 반환"""
+    labels      = list(CRISIS_PERIODS_COMP.keys())
+    latest      = assets_df.index[-1]
+    asset_keys  = [col  for col, _    in ASSET_LIST if col in assets_df.columns]
+    asset_names = [name for col, name in ASSET_LIST if col in assets_df.columns]
+
+    z, text = [], []
+    for crisis_name in labels:
+        start, end = CRISIS_PERIODS_COMP[crisis_name]
+        start_ts = pd.Timestamp(start)
+        end_ts   = latest if end is None else pd.Timestamp(end)
+        sub = assets_df.loc[(assets_df.index >= start_ts) & (assets_df.index <= end_ts)]
+
+        row_z, row_text = [], []
+        for col_key in asset_keys:
+            s = sub[col_key].dropna() if col_key in sub.columns else pd.Series()
+            if len(s) < 2:
+                row_z.append(np.nan)
+                row_text.append("N/A")
+                continue
+            ret = (s.iloc[-1] / s.iloc[0] - 1) * 100
+            mdd = calc_mdd(s)
+            ret_str = f"+{ret:.1f}%" if ret >= 0 else f"{ret:.1f}%"
+            row_z.append(round(ret, 1))
+            row_text.append(f"{ret_str}<br>MDD:{mdd:.1f}%")
+        z.append(row_z)
+        text.append(row_text)
+
+    return labels, asset_names, z, text
+
+
+# =====================================
+# 월별 수익률 계산
+# =====================================
+def compute_monthly_returns(price_df: pd.DataFrame) -> pd.DataFrame:
+    """일간 가격 → 월말 가격 → 월별 수익률(%)"""
+    monthly_price = price_df.resample("ME").last()
+    monthly_ret   = monthly_price.pct_change() * 100
+    return monthly_ret
+
+
+def pivot_for_heatmap(ret_series: pd.Series) -> pd.DataFrame:
+    df = ret_series.dropna().to_frame("ret")
+    df["year"]  = df.index.year
+    df["month"] = df.index.month
+    pivot = df.pivot(index="year", columns="month", values="ret")
+    pivot.columns = [MONTH_KR[m-1] for m in pivot.columns]
+    pivot["연간"] = (1 + ret_series.dropna() / 100).resample("YE").prod().sub(1).mul(100).reindex(pivot.index)
+    return pivot
+
+
+# =====================================
+# 차트 빌드
+# =====================================
+def build_heatmap_html(monthly_ret: pd.DataFrame, regime_monthly: pd.Series) -> go.Figure:
+    available = [(col, name) for col, name in ASSET_LIST if col in monthly_ret.columns]
+    n         = len(available)
+
+    if n == 0:
+        print("  [경고] 사용 가능한 자산 없음")
+        return go.Figure()
+
+    ncols = 2
+    nrows = (n + ncols - 1) // ncols
+    titles = [name for _, name in available]
+    while len(titles) < nrows * ncols:
+        titles.append("")
+
+    fig = make_subplots(
+        rows=nrows, cols=ncols,
+        subplot_titles=titles,
+        vertical_spacing=0.04,
+        horizontal_spacing=0.06,
+    )
+
+    zmin, zmax = -20, 20
+
+    for idx, (col_key, display) in enumerate(available):
+        row = idx // ncols + 1
+        col = idx % ncols + 1
+
+        pivot = pivot_for_heatmap(monthly_ret[col_key])
+        years = pivot.index.tolist()
+        months = list(pivot.columns)
+
+        z    = pivot.values.tolist()
+        text = [[f"{v:.1f}%" if not np.isnan(v) else "" for v in row_vals]
+                for row_vals in pivot.values]
+
+        fig.add_trace(go.Heatmap(
+            z=z, x=months, y=[str(y) for y in years],
+            text=text, texttemplate="%{text}",
+            textfont=dict(size=9, color="white"),
+            colorscale=[
+                [0.0,  "#c0392b"], [0.35, "#e74c3c"], [0.45, "#7f3a3a"],
+                [0.5,  "#2d2d2d"], [0.55, "#2e6b45"], [0.65, "#27ae60"],
+                [1.0,  "#1a5276"],
+            ],
+            zmin=zmin, zmax=zmax,
+            showscale=(idx == 0),
+            colorbar=dict(
+                title=dict(text="%", font=dict(size=12, color="white")),
+                x=1.02, len=0.3,
+                tickfont=dict(size=10, color="white"),
+            ) if idx == 0 else None,
+            hovertemplate=(
+                f"<b>{display}</b><br>기간: %{{y}}년 %{{x}}<br>수익률: %{{text}}<extra></extra>"
+            ),
+        ), row=row, col=col)
+
+    fig.update_layout(
+        title=dict(
+            text="<b>자산별 월별 수익률 히트맵 (2000~현재)</b>",
+            font=dict(size=21, family="Malgun Gothic", color="white"),
+            x=0.5,
+        ),
+        template="plotly_dark",
+        height=max(600, nrows * 320),
+        font=dict(family="Malgun Gothic", size=12, color="white"),
+        dragmode="pan", autosize=True,
+    )
+
+    for ann in fig.layout.annotations:
+        ann.update(font=dict(color="rgba(255,255,255,0.85)", family="Malgun Gothic"))
+
+    for r in range(1, nrows + 1):
+        for c in range(1, ncols + 1):
+            fig.update_yaxes(autorange="reversed", row=r, col=c)
+
+    return fig
+
+
+# =====================================
+# 국면별 자산 성과 요약
+# =====================================
+def build_regime_performance(monthly_ret: pd.DataFrame, regime_monthly: pd.Series,
+                              assets_df: pd.DataFrame = None) -> go.Figure:
+    available = [(col, name) for col, name in ASSET_LIST if col in monthly_ret.columns]
+    show_heatmap = assets_df is not None and not assets_df.empty
+
+    if show_heatmap:
+        fig = make_subplots(
+            rows=2, cols=1,
+            subplot_titles=("국면별 자산 평균 월수익률", "위기 구간별 자산 수익률 / MDD"),
+            vertical_spacing=0.22,
+            specs=[[{"type": "bar"}], [{"type": "heatmap"}]],
+            row_heights=[0.38, 0.62],
+        )
+    else:
+        fig = make_subplots(rows=1, cols=1, subplot_titles=("국면별 자산 평균 월수익률",))
+
+    if not regime_monthly.empty and available:
+        regime_monthly = regime_monthly.copy()
+        monthly_ret    = monthly_ret.copy()
+        regime_monthly.index = regime_monthly.index.to_period("M").to_timestamp("M")
+        monthly_ret.index    = monthly_ret.index.to_period("M").to_timestamp("M")
+        merged = monthly_ret[[c for c, _ in available]].join(
+            regime_monthly.rename("국면"), how="inner"
+        ).dropna(subset=["국면"])
+
+        regime_order = ["붐(강세)", "골디락스", "스태그플레이션", "침체(위기)", "전환기(TRAN)", "미확정"]
+        regimes = [r for r in regime_order if r in merged["국면"].unique()]
+
+        perf = {}
+        for regime in regimes:
+            sub = merged[merged["국면"] == regime][[c for c, _ in available]]
+            perf[regime] = sub.mean()
+        perf_df = pd.DataFrame(perf).T
+
+        bar_colors = ["#2c3e50","#3498db","#1abc9c","#e74c3c","#8e44ad",
+                      "#f39c12","#27ae60","#95a5a6","#2980b9","#e67e22","#16a085"]
+        for i, (col_key, display) in enumerate(available):
+            if col_key not in perf_df.columns:
+                continue
+            fig.add_trace(go.Bar(
+                name=display, x=regimes,
+                y=perf_df[col_key].reindex(regimes).values,
+                marker_color=bar_colors[i % len(bar_colors)],
+                hovertemplate=f"<b>{display}</b><br>국면: %{{x}}<br>평균 월수익률: %{{y:.2f}}%<extra></extra>",
+                legendgroup="bar",
+            ), row=1, col=1)
+
+        fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.4)", line_width=1, row=1, col=1)
+        fig.update_xaxes(title_text="국면",              row=1, col=1)
+        fig.update_yaxes(title_text="평균 월수익률 (%)", row=1, col=1)
+
+    if show_heatmap:
+        labels, asset_names, z_mat, text_mat = calc_crisis_heatmap_data(assets_df)
+        colorscale = [
+            [0.0, "#c0392b"], [0.35, "#e74c3c"], [0.45, "#7f3a3a"],
+            [0.5, "#2d2d2d"], [0.55, "#2e6b45"], [0.65, "#27ae60"], [1.0, "#1a5276"],
+        ]
+        fig.add_trace(go.Heatmap(
+            z=z_mat, x=asset_names, y=labels,
+            text=text_mat, texttemplate="%{text}",
+            textfont=dict(size=12, family="Malgun Gothic", color="white"),
+            colorscale=colorscale, zmid=0, zmin=-60, zmax=60, showscale=True,
+            colorbar=dict(
+                title=dict(text="%", font=dict(size=13, color="white")),
+                tickfont=dict(size=12, color="white"),
+                x=1.01, len=0.40, thickness=14,
+            ),
+            hovertemplate="<b>%{y}</b><br>자산: %{x}<br>%{text}<extra></extra>",
+            hoverlabel=dict(bgcolor="#2c3e50", font=dict(size=14, color="white", family="Malgun Gothic")),
+            showlegend=False,
+        ), row=2, col=1)
+        fig.update_yaxes(autorange="reversed", row=2, col=1)
+
+    total_height = 1150 if show_heatmap else 500
+    fig.update_layout(
+        barmode="group", template="plotly_dark", height=total_height,
+        font=dict(family="Malgun Gothic", color="white"),
+        dragmode="pan", autosize=True,
+        margin=dict(l=50, r=220, t=80, b=40),
+        legend=dict(
+            orientation="v", x=1.08, y=0.98, xanchor="left", yanchor="top",
+            font=dict(size=13, color="white"),
+            bgcolor="rgba(0,0,0,0.4)",
+            bordercolor="rgba(255,255,255,0.2)", borderwidth=1,
+            itemclick=False, itemdoubleclick=False,
+        ),
+    )
+
+    for ann in fig.layout.annotations:
+        if ann.text in ("국면별 자산 평균 월수익률", "위기 구간별 자산 수익률 / MDD"):
+            ann.update(
+                font=dict(size=18, family="Malgun Gothic", color="rgba(255,255,255,0.9)"),
+                x=0.0, xanchor="left", xref="paper",
+            )
+    return fig
+
+
+# =====================================
+# 위기 국면 비교 분석
+# =====================================
+
+def _make_crisis_periods_comp(data_end_label: str = "") -> dict:
+    label = f"현재 (2026.01.01 ~ {data_end_label})" if data_end_label else "현재 (2026~)"
+    return {
+        "닷컴버블 붕괴 (2000~2002)":    ("2000-03-01", "2002-10-31"),
+        "리먼브라더스 (2008~2009)":      ("2008-09-01", "2009-06-30"),
+        "유럽 재정위기 (2011)":          ("2011-07-01", "2011-11-30"),
+        "1차 미중 무역전쟁 (2018~2019)": ("2018-10-01", "2019-01-31"),
+        "코로나19 (2020)":               ("2020-02-01", "2020-04-30"),
+        "인플레·긴축 충격 (2022)":       ("2022-01-01", "2022-10-31"),
+        label:                           ("2026-01-01", None),
+    }
+
+CRISIS_PERIODS_COMP = _make_crisis_periods_comp()  # 초기값 (main에서 데이터 로드 후 갱신)
+
+
+def _build_current_hover_info(df: pd.DataFrame) -> dict:
+    """
+    2026년 이후 '현재' 구간 hover 텍스트를 실제 데이터 기반으로 자동 생성.
+    df: load_crisis_data() 반환값 (일간 데이터, 최신 날짜 기준)
+    """
+    latest = df.index[-1]
+    as_of  = latest.strftime("%Y.%m.%d")
+
+    def latest_val(col):
+        if col not in df.columns:
+            return None
+        s = df[col].dropna()
+        return s.iloc[-1] if not s.empty else None
+
+    def prev_val(col, days=252):
+        """약 1년 전 값"""
+        if col not in df.columns:
+            return None
+        s = df[col].dropna()
+        if len(s) < days:
+            return s.iloc[0] if not s.empty else None
+        return s.iloc[-days]
+
+    def ytd_return(col):
+        """연초(1월 1일) 대비 현재 수익률 (%)"""
+        if col not in df.columns:
+            return None, None
+        s = df[col].dropna()
+        if s.empty:
+            return None, None
+        cur_date = s.index[-1]
+        cur_val  = s.iloc[-1]
+        # 당해 연도 1월 첫 거래일 값
+        year_start = pd.Timestamp(f"{cur_date.year}-01-01")
+        ytd_s = s[s.index >= year_start]
+        if ytd_s.empty:
+            return None, None
+        start_val = ytd_s.iloc[0]
+        if start_val == 0:
+            return None, None
+        return (cur_val / start_val - 1) * 100, cur_val
+
+    indicators = []
+
+    # ── VIX ──────────────────────────────────
+    vix = latest_val("VIX")
+    if vix is not None:
+        if vix >= 30:
+            vix_txt = f"{vix:.1f} — 공포 구간 (고위험)"
+        elif vix >= 20:
+            vix_txt = f"{vix:.1f} — 경계 구간"
+        else:
+            vix_txt = f"{vix:.1f} — 안정 구간"
+        indicators.append(["VIX", vix_txt])
+
+    # ── S&P500 (연초 대비 수익률) ─────────────
+    sp_ytd, sp_cur = ytd_return("SP500")
+    if sp_ytd is not None:
+        if sp_ytd >= 10:
+            sp_txt = f"연초 대비 {sp_ytd:+.1f}% (강세)"
+        elif sp_ytd >= 0:
+            sp_txt = f"연초 대비 {sp_ytd:+.1f}% (보합·상승)"
+        elif sp_ytd >= -10:
+            sp_txt = f"연초 대비 {sp_ytd:+.1f}% (조정)"
+        else:
+            sp_txt = f"연초 대비 {sp_ytd:+.1f}% (약세장)"
+        indicators.append(["S&P500", sp_txt])
+
+    # ── 장단기금리차 ─────────────────────────
+    spread = latest_val("장단기금리차(10Y-2Y)")
+    if spread is not None:
+        if spread >= 0.5:
+            sp_label = f"{spread:+.2f}%p — 정상화 (확장 신호)"
+        elif spread >= 0:
+            sp_label = f"{spread:+.2f}%p — 정상화 (회복 중)"
+        elif spread >= -0.5:
+            sp_label = f"{spread:+.2f}%p — 소폭 역전"
+        else:
+            sp_label = f"{spread:+.2f}%p — 역전 (침체 경고)"
+        indicators.append(["장단기금리차", sp_label])
+
+    # ── 달러(DXY) — 전년 대비 방향 ──────────
+    dxy_cur  = latest_val("달러인덱스DXY")
+    dxy_prev = prev_val("달러인덱스DXY", 252)
+    if dxy_cur is not None and dxy_prev is not None:
+        dxy_chg = (dxy_cur / dxy_prev - 1) * 100
+        if dxy_chg >= 3:
+            dxy_txt = f"{dxy_cur:.1f} | 전년비 {dxy_chg:+.1f}% 강세"
+        elif dxy_chg <= -3:
+            dxy_txt = f"{dxy_cur:.1f} | 전년비 {dxy_chg:+.1f}% 약세"
+        else:
+            dxy_txt = f"{dxy_cur:.1f} | 전년비 {dxy_chg:+.1f}% 보합"
+        indicators.append(["달러(DXY)", dxy_txt])
+
+    # ── HY 크레딧 스프레드 ───────────────────
+    hy = latest_val("HY크레딧스프레드")
+    if hy is not None:
+        if hy >= 6:
+            hy_txt = f"{hy:.2f}% — 위기 수준 (급확대)"
+        elif hy >= 4:
+            hy_txt = f"{hy:.2f}% — 경계 구간"
+        elif hy >= 3:
+            hy_txt = f"{hy:.2f}% — 완화 (중립)"
+        else:
+            hy_txt = f"{hy:.2f}% — 타이트 (낙관)"
+        indicators.append(["HY 스프레드", hy_txt])
+
+    # ── note 자동 생성 ───────────────────────
+    risk_flags = []
+    if vix is not None and vix >= 25:
+        risk_flags.append("변동성 확대")
+    if sp_ytd is not None and sp_ytd <= -10:
+        risk_flags.append("주식 조정")
+    if spread is not None and spread < 0:
+        risk_flags.append("금리 역전")
+    if hy is not None and hy >= 5:
+        risk_flags.append("신용 위험 상승")
+
+    if risk_flags:
+        note = "주요 위험 신호: " + " / ".join(risk_flags)
+    else:
+        note = "주요 위험 신호 미감지. 지표 안정권"
+
+    return {
+        "title": f"현재 ({as_of} 기준)",
+        "period": f"2026.01 ~ 진행중",
+        "indicators": indicators,
+        "note": note,
+    }
+
+INDICATORS_COMP = {
+    "VIX":               ("VIX",              1),
+    "장단기금리차(10Y-2Y)": ("장단기금리차(10Y-2Y)", -1),
+    "HY크레딧스프레드":   ("HY크레딧스프레드",   1),
+    "미국CPI":            ("미국CPI",           1),
+    "실질금리TIPS10Y":    ("실질금리TIPS10Y",    1),
+    "달러인덱스DXY":      ("달러인덱스DXY",      1),
+    "SP500(전년비%)":     ("SP500_yoy",        -1),  # 절대가격 → 전년 대비 변화율
+    "미국실업률":         ("미국실업률",         1),
+}
+
+CRISIS_COLORS_COMP = [
+    "#e74c3c","#e67e22","#f1c40f",
+    "#2ecc71","#3498db","#9b59b6","#1abc9c"
+]
+
+# ═══════════════════════════════════════════════════════════
+# ▼▼▼  DTW 유사시점분석 통합 상수 (시각화_04 통합)  ▼▼▼
+# ═══════════════════════════════════════════════════════════
+
+DTW_WINDOW            = 12    # DTW 비교 구간 길이 (개월)
+DTW_TOP_N             = 5     # 상위 유사 구간 개수
+DTW_MIN_HISTORY       = 36    # 유사도 계산 시작 최소 이력 (개월)
+DTW_EXCLUDE_RECENT    = 24    # 최근 N개월은 후보에서 제외
+DTW_NON_OVERLAP       = True  # 상위 결과가 서로 겹치지 않도록 강제
+DTW_PERCENTILE_WINDOW = 60    # 롤링 백분위 윈도우 (개월)
+
+# DTW 지표 정의 (표시명 → 컬럼명)
+DTW_INDICATORS = {
+    "VIX":               "VIX",
+    "장단기금리차(10Y-2Y)": "장단기금리차(10Y-2Y)",
+    "HY크레딧스프레드":   "HY크레딧스프레드",
+    "미국CPI":            "미국CPI",
+    "실질금리TIPS10Y":    "실질금리TIPS10Y",
+    "달러인덱스DXY":      "달러인덱스DXY",
+    "SP500_수준":         "SP500",
+    "미국실업률":         "미국실업률",
+    "금현물가격":         "금현물가격",
+    "WTI원유":            "WTI원유",
+}
+
+# DTW 상위 유사 시점 색상
+DTW_TOP_COLORS = ["#e74c3c", "#e67e22", "#f1c40f", "#2ecc71", "#3498db",
+                  "#9b59b6", "#1abc9c", "#fd79a8", "#a29bfe", "#00cec9"]
+
+# 지표별 방향 설명 (DTW 유사 이유 자동 생성용)
+_DTW_NARR = {
+    "VIX":               ("VIX 급등·리스크오프",  "VIX 하락·안도"),
+    "장단기금리차(10Y-2Y)": ("금리차 확대",          "금리차 축소·역전"),
+    "HY크레딧스프레드":   ("크레딧 경색",           "크레딧 완화"),
+    "미국CPI":            ("인플레 가속",           "인플레 둔화"),
+    "실질금리TIPS10Y":    ("실질금리 상승",         "실질금리 하락"),
+    "달러인덱스DXY":      ("달러 강세",             "달러 약세"),
+    "SP500":              ("주가 상승",             "주가 하락"),
+    "미국실업률":         ("실업률 악화",           "실업률 개선"),
+    "금현물가격":         ("금 강세·안전자산 선호", "금 약세·위험선호"),
+    "WTI원유":            ("유가 상승·경기 기대",   "유가 하락·수요 둔화"),
+}
+
+# 주요 위기 구간 이름 매핑 (DTW 레이블용)
+_DTW_CRISIS_PERIODS = [
+    ("1987-10-01", "1987-12-31", "블랙먼데이"),
+    ("1997-07-01", "1998-09-30", "아시아 외환위기"),
+    ("2000-03-01", "2002-10-31", "닷컴버블 붕괴"),
+    ("2007-10-01", "2009-06-30", "글로벌 금융위기"),
+    ("2010-04-01", "2010-07-31", "유럽 재정위기 1차"),
+    ("2011-07-01", "2011-11-30", "유럽 재정위기 2차"),
+    ("2014-09-01", "2016-02-29", "신흥국 위기·원자재 급락"),
+    ("2018-10-01", "2019-01-31", "미중 무역전쟁"),
+    ("2020-02-01", "2020-04-30", "코로나19"),
+    ("2022-01-01", "2022-10-31", "인플레이션·긴축 충격"),
+    ("2026-01-01", "2030-12-31", "현재(2026~)"),
+]
+
+
+def _dtw_period_label(end_date: pd.Timestamp) -> str:
+    """
+    DTW 유사 구간(종료일 기준 DTW_WINDOW개월)을 위기 이름으로 반환.
+    가장 많이 겹치는 위기 구간의 이름을 선택. 매핑 없으면 날짜 표시.
+    """
+    start_date   = end_date - pd.DateOffset(months=DTW_WINDOW)
+    best_label   = None
+    best_overlap = 0
+    for cs, ce, cname in _DTW_CRISIS_PERIODS:
+        cs_ts = pd.Timestamp(cs)
+        ce_ts = pd.Timestamp(ce)
+        overlap_start = max(start_date, cs_ts)
+        overlap_end   = min(end_date,   ce_ts)
+        if overlap_end > overlap_start:
+            overlap_days = (overlap_end - overlap_start).days
+            if overlap_days > best_overlap:
+                best_overlap = overlap_days
+                best_label   = cname
+    if best_label:
+        return best_label
+    return f"{start_date.strftime('%Y.%m')}~{end_date.strftime('%Y.%m')}"
+
+
+# =====================================
+# DTW 데이터 로드 / 전처리
+# =====================================
+
+def dtw_load_indicator_data() -> pd.DataFrame:
+    """FRED 일간/월간 병합 → 월말 리샘플 (DTW 분석용)"""
+    xl = pd.ExcelFile(FRED_PATH)
+    daily   = pd.read_excel(xl, sheet_name="일간데이터",
+                            index_col=0, parse_dates=True).sort_index()
+    monthly = pd.read_excel(xl, sheet_name="월간데이터",
+                            index_col=0, parse_dates=True).sort_index()
+    monthly_d = monthly.reindex(daily.index, method="ffill")
+    df = pd.concat([daily, monthly_d], axis=1)
+    df = df[~df.index.duplicated(keep="first")].sort_index()
+    if "금현물가격(USD/oz)" in df.columns and "금현물가격" not in df.columns:
+        df = df.rename(columns={"금현물가격(USD/oz)": "금현물가격"})
+    monthly_final = df.resample("ME").last()
+    for c in monthly_final.columns:
+        monthly_final[c] = pd.to_numeric(monthly_final[c], errors="coerce")
+    return monthly_final
+
+
+def dtw_build_indicator_matrix(monthly_df: pd.DataFrame) -> pd.DataFrame:
+    """DTW 지표 컬럼 추출"""
+    ind_cols = [col for col in DTW_INDICATORS.values() if col in monthly_df.columns]
+    missing  = [k for k, v in DTW_INDICATORS.items() if v not in monthly_df.columns]
+    if missing:
+        print(f"  [DTW 경고] 누락 지표: {missing}")
+    return monthly_df[ind_cols].copy()
+
+
+def dtw_compute_percentile_matrix(ind_matrix: pd.DataFrame) -> pd.DataFrame:
+    """
+    각 지표의 월간 변화량(방향·속도)을 롤링 백분위로 변환 (DTW용).
+    레벨이 아닌 diff(1)에 대해 롤링 DTW_PERCENTILE_WINDOW개월 백분위 계산.
+    """
+    diff_matrix = ind_matrix.diff(1)
+    scores = pd.DataFrame(index=ind_matrix.index,
+                          columns=ind_matrix.columns, dtype=float)
+    for col in diff_matrix.columns:
+        if diff_matrix[col].dropna().shape[0] < DTW_PERCENTILE_WINDOW // 2:
+            continue
+        rolling_pct = pd.Series(index=diff_matrix.index, dtype=float)
+        for t in range(len(diff_matrix)):
+            if pd.isna(diff_matrix[col].iloc[t]):
+                continue
+            window_start = max(0, t - DTW_PERCENTILE_WINDOW)
+            window = diff_matrix[col].iloc[window_start:t].dropna()
+            if len(window) < 6:
+                continue
+            val = diff_matrix[col].iloc[t]
+            rolling_pct.iloc[t] = (window < val).sum() / len(window)
+        scores[col] = rolling_pct
+    return scores.astype(float)
+
+
+def compute_dtw_similarity(scores: pd.DataFrame) -> pd.Series:
+    """
+    DTW(Dynamic Time Warping) 기반 구간 유사도 계산.
+    현재 직전 DTW_WINDOW개월 궤적 vs 과거 슬라이딩 구간 비교 → 유사도(%)
+    """
+    valid_dates = scores.dropna(how="all").index
+    if len(valid_dates) < DTW_MIN_HISTORY + DTW_WINDOW:
+        print("  [DTW 경고] 데이터 부족")
+        return pd.Series(dtype=float)
+
+    current_date = valid_dates[-1]
+    cutoff_date  = current_date - pd.DateOffset(months=DTW_EXCLUDE_RECENT)
+    current_window = scores.loc[scores.index <= current_date].tail(DTW_WINDOW)
+
+    valid_cols = [
+        c for c in scores.columns
+        if current_window[c].notna().sum() >= DTW_WINDOW // 2
+    ]
+    if len(valid_cols) < 3:
+        print(f"  [DTW 경고] 유효 지표 부족: {len(valid_cols)}개")
+        return pd.Series(dtype=float)
+
+    curr_arr = current_window[valid_cols].interpolate().bfill().values.T
+    col_std  = curr_arr.std(axis=1, keepdims=True)
+    col_std[col_std == 0] = 1
+    curr_arr = curr_arr / col_std
+
+    dist_dict  = {}
+    candidates = [d for d in valid_dates if d <= cutoff_date]
+    for i in range(DTW_WINDOW, len(candidates)):
+        end_date    = candidates[i]
+        start_date  = candidates[i - DTW_WINDOW]
+        past_window = scores.loc[start_date:end_date, valid_cols]
+        if len(past_window) < DTW_WINDOW // 2:
+            continue
+        past_arr = past_window.interpolate().bfill().values.T
+        past_arr = past_arr / col_std
+
+        total_dist, n_channels = 0.0, 0
+        for ch in range(len(valid_cols)):
+            try:
+                d = dtw.distance_fast(
+                    curr_arr[ch].astype(np.double),
+                    past_arr[ch].astype(np.double)
+                )
+                if np.isnan(d) or np.isinf(d):
+                    continue
+                total_dist += d
+                n_channels += 1
+            except Exception:
+                continue
+        if n_channels > 0:
+            dist_dict[end_date] = total_dist / n_channels
+
+    if not dist_dict:
+        return pd.Series(dtype=float)
+
+    dist_series = pd.Series(dist_dict).dropna()
+    max_dist = float(np.nanpercentile(dist_series.values, 95))
+    if max_dist == 0:
+        max_dist = float(dist_series.max()) or 1.0
+
+    sim_dict = {
+        d: round(max(0.0, (1 - v / max_dist) * 100), 2)
+        for d, v in dist_dict.items()
+    }
+    return pd.Series(sim_dict).sort_index()
+
+
+def dtw_get_top_similar(similarity: pd.Series, n: int = DTW_TOP_N) -> pd.Series:
+    """유사도 상위 N 구간 반환 (겹치지 않는 구간만)"""
+    if not DTW_NON_OVERLAP:
+        return similarity.nlargest(n)
+    sorted_sim = similarity.sort_values(ascending=False)
+    selected = {}
+    for date, sim_val in sorted_sim.items():
+        overlap = any(
+            abs((date - sel_date).days) < DTW_WINDOW * 30
+            for sel_date in selected
+        )
+        if not overlap:
+            selected[date] = sim_val
+        if len(selected) >= n:
+            break
+    return pd.Series(selected).sort_values(ascending=False)
+
+
+def dtw_generate_description(end_date: pd.Timestamp,
+                              scores: pd.DataFrame,
+                              max_items: int = 3) -> str:
+    """유사 구간 내 지표 모멘텀 평균으로 '왜 유사한가' 설명 자동 생성"""
+    start_date = end_date - pd.DateOffset(months=DTW_WINDOW)
+    window = scores.loc[(scores.index >= start_date) & (scores.index <= end_date)]
+    if window.empty:
+        return ""
+    col_avg   = window.mean()
+    deviation = (col_avg - 0.5).abs()
+    top_cols  = deviation.nlargest(max_items + 2).index
+    parts = []
+    for col in top_cols:
+        if col not in _DTW_NARR or pd.isna(col_avg[col]):
+            continue
+        avg = col_avg[col]
+        if avg >= 0.68:
+            parts.append(_DTW_NARR[col][0])
+        elif avg <= 0.32:
+            parts.append(_DTW_NARR[col][1])
+        if len(parts) == max_items:
+            break
+    return " · ".join(parts) if parts else "패턴 유사"
+
+
+def _dtw_forward_returns(asset_df: pd.DataFrame,
+                         end_date: pd.Timestamp,
+                         horizons: list = [3, 6, 12]) -> dict:
+    """
+    end_date 시점부터 horizons 개월 후 자산별 수익률(%) 계산.
+    반환: {col_key: {3: ret_pct, 6: ret_pct, 12: ret_pct}}
+    """
+    FWD_ASSETS = [
+        ("SP500",            "S&P 500"),
+        ("NASDAQ100",        "NASDAQ 100"),
+        ("금현물가격",       "금"),
+        ("달러인덱스DXY",    "달러"),
+        ("미국7-10년국채TR", "미국채"),
+        ("미국HY채권TR",     "HY채권"),
+        ("WTI원유",          "WTI"),
+    ]
+    result = {}
+    for col, name in FWD_ASSETS:
+        if col not in asset_df.columns:
+            continue
+        s = asset_df[col].dropna()
+        # 기준 가격: end_date 이전 가장 가까운 거래일
+        base_idx = s.index[s.index <= end_date]
+        if base_idx.empty:
+            continue
+        p0 = s.loc[base_idx[-1]]
+        rets = {}
+        for h in horizons:
+            target = end_date + pd.DateOffset(months=h)
+            future_idx = s.index[s.index >= target]
+            if future_idx.empty:
+                rets[h] = None
+            else:
+                p1 = s.loc[future_idx[0]]
+                rets[h] = round((p1 / p0 - 1) * 100, 1) if p0 > 0 else None
+        result[name] = rets
+    return result
+
+
+def build_dtw_timeline(similarity: pd.Series,
+                       top_similar: pd.Series,
+                       scores: pd.DataFrame,
+                       asset_df: pd.DataFrame = None) -> go.Figure:
+    """
+    DTW 유사도 타임라인 그래프.
+    - x축 스크롤 확대만 허용 (y축 고정)
+    - 음영 구간에 마우스 올리면 팝업: 지표 특징 + 사후 수익률
+    - 별 마커 없음, 구간 레이블만 annotation으로 표시
+    """
+    fig = go.Figure()
+
+    # 고유사도 구간 배경
+    fig.add_hrect(y0=60, y1=100, fillcolor="rgba(39,174,96,0.07)",
+                  line_width=0, annotation_text="고유사도 구간 (60%+)",
+                  annotation_position="top right",
+                  annotation_font=dict(color="rgba(39,174,96,0.7)", size=11))
+
+    # DTW 유사도 라인
+    fig.add_trace(go.Scatter(
+        x=similarity.index, y=similarity.values,
+        mode="lines", name="DTW 유사도",
+        line=dict(color="rgba(52,152,219,0.6)", width=1.5),
+        fill="tozeroy", fillcolor="rgba(52,152,219,0.08)",
+        hovertemplate="%{x|%Y년 %m월} 종료 구간<br>DTW 유사도: %{y:.1f}%<extra></extra>",
+    ))
+
+    # EMA 추세선
+    ema = similarity.ewm(span=6).mean()
+    fig.add_trace(go.Scatter(
+        x=ema.index, y=ema.values,
+        mode="lines", name="EMA(6개월)",
+        line=dict(color="rgba(52,152,219,0.9)", width=2, dash="dot"),
+        hoverinfo="skip",
+    ))
+
+    # 상위 N 구간: 음영 + 팝업 + 레이블
+    for i, (end_date, sim_val) in enumerate(top_similar.items()):
+        color       = DTW_TOP_COLORS[i % len(DTW_TOP_COLORS)]
+        rank        = i + 1
+        start_date  = end_date - pd.DateOffset(months=DTW_WINDOW)
+        crisis_name = _dtw_period_label(end_date)
+        date_range  = f"{start_date.strftime('%Y.%m')} ~ {end_date.strftime('%Y.%m')}"
+        description = dtw_generate_description(end_date, scores)
+
+        # 구간 경계선
+        ed_str = end_date.strftime("%Y-%m-%d")
+        fig.add_shape(type="line", x0=ed_str, x1=ed_str, y0=0, y1=1,
+                      xref="x", yref="paper",
+                      line=dict(color=color, width=1.5, dash="dash"))
+
+        # ── 사후 수익률 계산 ──
+        fwd_rets = {}
+        if asset_df is not None:
+            fwd_rets = _dtw_forward_returns(asset_df, end_date)
+
+        # 사후 수익률 호버 텍스트 구성
+        fwd_lines = ""
+        if fwd_rets:
+            # +12M 수익률 기준 상위 자산 강조
+            ret12 = {name: rets.get(12) for name, rets in fwd_rets.items()
+                     if rets.get(12) is not None}
+            top_asset = max(ret12, key=ret12.get) if ret12 else None
+
+            fwd_lines = "<br><b>─ 이후 자산 수익률 ─</b>"
+            fwd_lines += "<br><span style='font-size:10px;color:rgba(255,255,255,0.5)'>자산 &nbsp;&nbsp;&nbsp; +3M &nbsp;&nbsp; +6M &nbsp;&nbsp; +12M</span>"
+            for name, rets in fwd_rets.items():
+                r3  = f"{rets[3]:+.1f}%"  if rets.get(3)  is not None else "N/A"
+                r6  = f"{rets[6]:+.1f}%"  if rets.get(6)  is not None else "N/A"
+                r12 = f"{rets[12]:+.1f}%" if rets.get(12) is not None else "N/A"
+                star = " ★" if name == top_asset else ""
+                # 색상: 12M 기준
+                if rets.get(12) is not None:
+                    c12 = "#2ecc71" if rets[12] >= 0 else "#e74c3c"
+                else:
+                    c12 = "rgba(255,255,255,0.5)"
+                fwd_lines += (
+                    f"<br><span style='color:rgba(255,255,255,0.85)'>{name}{star}</span>"
+                    f"  {r3} / {r6} / "
+                    f"<span style='color:{c12};font-weight:bold'>{r12}</span>"
+                )
+
+        # ── 지표 특징 텍스트 ──
+        char_line = f"<br><b>─ 지표 특징 ─</b><br>{description}" if description else ""
+
+        hover_text = (
+            f"<b>#{rank}위 유사 구간</b><br>"
+            f"<span style='color:{color};font-weight:bold'>{crisis_name}</span>"
+            f"  <span style='color:rgba(255,255,255,0.5);font-size:11px'>({date_range})</span><br>"
+            f"DTW 유사도: <b>{sim_val:.1f}%</b>"
+            f"{char_line}"
+            f"{fwd_lines}"
+            f"<extra></extra>"
+        )
+
+        # ── 음영 (vrect 대용 — 별도 shape) ──
+        h = color.lstrip("#")
+        r_int, g_int, b_int = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        fill_rgba = f"rgba({r_int},{g_int},{b_int},0.10)"
+        fig.add_shape(
+            type="rect",
+            x0=start_date.strftime("%Y-%m-%d"), x1=end_date.strftime("%Y-%m-%d"),
+            y0=0, y1=105,
+            fillcolor=fill_rgba, line_width=0, layer="below",
+        )
+
+        # ── 호버 캡처: 구간 내 격자 포인트 ──
+        # Plotly는 실제 데이터 포인트 근처에서만 hover를 감지하므로,
+        # x(월별) × y(20/40/60/80) 격자로 촘촘히 포인트를 뿌려
+        # 음영 전 영역에서 hover가 뜨도록 함.
+        grid_x_dates = pd.date_range(start=start_date, end=end_date, freq="MS")
+        if len(grid_x_dates) == 0:
+            grid_x_dates = pd.DatetimeIndex([start_date, end_date])
+        grid_y_levels = [15, 35, 55, 75, 95]
+        gx, gy = [], []
+        for gd in grid_x_dates:
+            for gy_val in grid_y_levels:
+                gx.append(gd)
+                gy.append(gy_val)
+
+        fig.add_trace(go.Scatter(
+            x=gx, y=gy,
+            mode="markers",
+            marker=dict(size=18, opacity=0, color=color),  # 완전 투명 — 보이지 않음
+            name=f"#{rank} {crisis_name}",
+            hovertemplate=hover_text,
+            hoverlabel=dict(
+                bgcolor="#1a2535",
+                bordercolor=color,
+                font=dict(size=12, family="Malgun Gothic", color="white"),
+                namelength=0,
+            ),
+            showlegend=False,
+        ))
+
+        # ── 구간 이름 레이블 (annotation) ──
+        mid_date = start_date + (end_date - start_date) / 2
+        fig.add_annotation(
+            x=mid_date.strftime("%Y-%m-%d"), y=92,
+            xref="x", yref="y",
+            text=f"<b>#{rank}</b><br>{crisis_name}",
+            showarrow=False,
+            font=dict(size=13, color=color, family="Malgun Gothic"),
+            bgcolor="rgba(0,0,0,0.72)",
+            bordercolor=color, borderwidth=1.5, borderpad=6, opacity=0.96,
+            align="center",
+        )
+
+    # ── 우측 순위 요약 박스 ──
+    rank_lines = ["<b>▶ 유사 구간 순위</b>"]
+    for i, (end_date_r, sim_val_r) in enumerate(top_similar.items()):
+        c_r    = DTW_TOP_COLORS[i % len(DTW_TOP_COLORS)]
+        name_r = _dtw_period_label(end_date_r)
+        rank_lines.append(
+            f"<span style='color:{c_r}'>#{i+1}</span>  {name_r}  "
+            f"<span style='color:rgba(255,255,255,0.55)'>({sim_val_r:.1f}%)</span>"
+        )
+    fig.add_annotation(
+        x=1.01, y=0.60,
+        xref="paper", yref="paper",
+        text="<br>".join(rank_lines),
+        showarrow=False,
+        align="left",
+        xanchor="left", yanchor="top",
+        font=dict(size=12, family="Malgun Gothic", color="white"),
+        bgcolor="rgba(26,26,46,0.85)",
+        bordercolor="rgba(255,255,255,0.2)", borderwidth=1, borderpad=8,
+    )
+
+    # 현재 시점 수직선
+    current_x = similarity.index[-1] if not similarity.empty else pd.Timestamp.now()
+    cx_str    = current_x.strftime("%Y-%m-%d")
+    fig.add_shape(type="line", x0=cx_str, x1=cx_str, y0=0, y1=1,
+                  xref="x", yref="paper",
+                  line=dict(color="rgba(255,255,255,0.6)", width=2, dash="dot"))
+    fig.add_annotation(x=cx_str, y=1.02, xref="x", yref="paper",
+                       text="현재", showarrow=False,
+                       font=dict(color="white", size=11))
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                "<b>현재 시장과 유사한 과거 구간 탐색 (DTW)</b>"
+                f"  <span style='font-size:14px;color:rgba(255,255,255,0.6)'>"
+                f"(비교 구간: {DTW_WINDOW}개월 궤적 · 음영=유사 구간)</span>"
+            ),
+            font=dict(size=20, family="Malgun Gothic", color="white"), x=0.0,
+        ),
+        xaxis=dict(
+            title="날짜", showgrid=True,
+            gridcolor="rgba(255,255,255,0.08)", tickformat="%Y",
+            fixedrange=False,   # x축: 스크롤 확대 허용
+        ),
+        yaxis=dict(
+            title="유사도 (%)", range=[0, 105],
+            showgrid=True, gridcolor="rgba(255,255,255,0.08)",
+            fixedrange=True,    # y축: 고정 (확대 불가)
+        ),
+        template="plotly_dark",
+        autosize=True,
+        height=520,          # 최소 기준 높이 — 실제 렌더는 컨테이너 크기에 따름
+        hovermode="closest",
+        font=dict(family="Malgun Gothic", color="white"),
+        legend=dict(
+            orientation="v", x=1.01, y=1.0, xanchor="left", yanchor="top",
+            font=dict(size=12), bgcolor="rgba(0,0,0,0.4)",
+            bordercolor="rgba(255,255,255,0.2)", borderwidth=1,
+        ),
+        dragmode=False,   # 좌클릭 드래그 이동 비활성화
+        margin=dict(l=60, r=280, t=80, b=50),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+# ═══════════════════════════════════════════════════════════
+# ▲▲▲  DTW 유사시점분석 통합 끝  ▲▲▲
+# ═══════════════════════════════════════════════════════════
+
+
+def load_crisis_data() -> pd.DataFrame:
+    """FRED + 지수데이터 병합 (위기분석용)"""
+    xl      = pd.ExcelFile(FRED_PATH)
+    daily   = pd.read_excel(xl, sheet_name="일간데이터",  index_col=0, parse_dates=True)
+    monthly = pd.read_excel(xl, sheet_name="월간데이터", index_col=0, parse_dates=True)
+    monthly_d = monthly.reindex(daily.index, method="ffill")
+    frames = [daily, monthly_d]
+    if "심리지수" in xl.sheet_names:
+        sent = pd.read_excel(xl, sheet_name="심리지수", index_col=0, parse_dates=True)
+        frames.append(sent.reindex(daily.index, method="ffill"))
+    df = pd.concat(frames, axis=1)
+    df = df[~df.index.duplicated(keep="first")].sort_index()
+
+    try:
+        raw = pd.read_excel(INDEX_PATH, sheet_name="Sheet6", header=None)
+        col_names = raw.iloc[8, 1:].tolist()
+        idx = raw.iloc[14:].copy()
+        idx.columns = ["Date"] + col_names
+        idx["Date"] = pd.to_datetime(idx["Date"], errors="coerce")
+        idx = idx.dropna(subset=["Date"]).set_index("Date").sort_index()
+        rmap = {"S&P 500": "SP500", "US Dollar Index": "달러인덱스DXY"}
+        idx  = idx.rename(columns=rmap)
+        for col in ["SP500", "달러인덱스DXY"]:
+            if col in idx.columns:
+                df[col] = pd.to_numeric(idx[col], errors="coerce").reindex(df.index, method="ffill")
+    except Exception:
+        pass
+
+    # SP500 전년 대비 변화율 (약 252 거래일 기준)
+    # 절대 가격 레벨 대신 등락률을 사용해 시대 간 비교 가능하게 함
+    if "SP500" in df.columns:
+        df["SP500_yoy"] = df["SP500"].pct_change(252) * 100
+
+    return df
+
+
+def compute_crisis_profiles(df: pd.DataFrame) -> pd.DataFrame:
+    rows = {}
+    for name, (start, end) in CRISIS_PERIODS_COMP.items():
+        end_ts = df.index[-1] if end is None else pd.Timestamp(end)
+        mask   = (df.index >= pd.Timestamp(start)) & (df.index <= end_ts)
+        sub    = df.loc[mask]
+        row    = {}
+        for ind, (col, _) in INDICATORS_COMP.items():
+            row[ind] = sub[col].mean() if col in sub.columns else np.nan
+        rows[name] = row
+    return pd.DataFrame(rows).T
+
+
+def compute_percentile_scores(df: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataFrame:
+    scores = pd.DataFrame(index=profiles.index, columns=profiles.columns, dtype=float)
+    for ind, (col, direction) in INDICATORS_COMP.items():
+        if col not in df.columns:
+            continue
+        series = df[col].dropna()
+        for crisis in profiles.index:
+            val = profiles.loc[crisis, ind]
+            if pd.isna(val):
+                scores.loc[crisis, ind] = np.nan
+                continue
+            pct = (series < val).mean() * 100
+            scores.loc[crisis, ind] = round(100 - pct if direction == -1 else pct, 1)
+    return scores
+
+
+def compute_similarity(scores: pd.DataFrame) -> pd.Series:
+    current_key = [k for k in scores.index if "현재" in k][0]
+    current_vec = scores.loc[current_key].fillna(50).values.astype(float)
+    sim = {}
+    for crisis in scores.index:
+        if "현재" in crisis:
+            continue
+        vec  = scores.loc[crisis].fillna(50).values.astype(float)
+        dist = cosine(current_vec, vec)
+        sim[crisis] = round((1 - dist) * 100, 1)
+    return pd.Series(sim).sort_values(ascending=False)
+
+
+# 수익률 표 대상 자산 (컬럼명, 표시명)
+RETURN_ASSETS = [
+    ("SP500",         "S&P 500"),
+    ("NASDAQ100",     "NASDAQ 100"),
+    ("DowJones",      "Dow Jones"),
+    ("NIKKEI225",     "NIKKEI 225"),
+    ("Shanghai",      "Shanghai"),
+    ("KOSPI",         "KOSPI"),
+    ("달러인덱스DXY", "달러 인덱스"),
+    ("금현물가격",    "금"),
+]
+
+
+def compute_crisis_returns(df: pd.DataFrame) -> dict:
+    """
+    위기 구간별 자산 기간 수익률 계산.
+    구간 첫 거래일 → 마지막 거래일 기준 단순 수익률(%).
+    반환: {crisis_name: {asset_name: return_pct or None}}
+    """
+    result = {}
+    for crisis_name, (start, end) in CRISIS_PERIODS_COMP.items():
+        start_ts = pd.Timestamp(start)
+        end_ts   = df.index[-1] if end is None else pd.Timestamp(end)
+        sub      = df.loc[(df.index >= start_ts) & (df.index <= end_ts)]
+        row = {}
+        for col, display in RETURN_ASSETS:
+            if col not in sub.columns:
+                row[display] = None
+                continue
+            s = sub[col].dropna()
+            if len(s) < 2:
+                row[display] = None
+                continue
+            ret = (s.iloc[-1] / s.iloc[0] - 1) * 100
+            row[display] = round(ret, 1)
+        result[crisis_name] = row
+    return result
+
+
+def build_crisis_bar_chart(profiles: pd.DataFrame,
+                           scores: pd.DataFrame,
+                           similarity: pd.Series):
+    """코사인 유사도 막대그래프 + customdata 반환"""
+    names  = list(CRISIS_PERIODS_COMP.keys())
+    colors = {n: CRISIS_COLORS_COMP[i % len(CRISIS_COLORS_COMP)] for i, n in enumerate(names)}
+
+    # 유사도 오름차순 정렬 → 막대가 위로 갈수록 높음
+    sim_sorted        = similarity.sort_values(ascending=True)
+    ind_names_list    = list(INDICATORS_COMP.keys())
+    current_key_score = [k for k in scores.index if "현재" in k][0]
+
+    customdata = []
+    for crisis in sim_sorted.index:
+        row_data = {"crisis": crisis, "sim": float(sim_sorted[crisis]), "indicators": []}
+        for ind in ind_names_list:
+            cur_val = scores.loc[current_key_score, ind]
+            cri_val = scores.loc[crisis, ind]
+            cur_raw = profiles.loc[current_key_score, ind]
+            cri_raw = profiles.loc[crisis, ind]
+            row_data["indicators"].append({
+                "name":    ind,
+                "cur_pct": round(float(cur_val), 1) if not pd.isna(cur_val) else None,
+                "cri_pct": round(float(cri_val), 1) if not pd.isna(cri_val) else None,
+                "cur_raw": round(float(cur_raw), 2) if not pd.isna(cur_raw) else None,
+                "cri_raw": round(float(cri_raw), 2) if not pd.isna(cri_raw) else None,
+            })
+        customdata.append(row_data)
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=sim_sorted.values,
+        y=sim_sorted.index,
+        orientation="h",
+        marker_color=[colors.get(n, "#95a5a6") for n in sim_sorted.index],
+        marker_line=dict(color="rgba(255,255,255,0.15)", width=1),
+        text=[f"{v:.1f}%" for v in sim_sorted.values],
+        textposition="outside",
+        textfont=dict(size=13, color="white"),
+        showlegend=False,
+        customdata=customdata,
+        hovertemplate="<b>%{y}</b><br>코사인 유사도: %{x:.1f}%<extra></extra>",
+    ))
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=400,
+        autosize=True,
+        xaxis=dict(
+            title="코사인 유사도 (%)",
+            range=[0, 115],
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.08)",
+        ),
+        yaxis=dict(autorange=True, tickfont=dict(size=13)),
+        margin=dict(l=10, r=70, t=10, b=40),
+        font=dict(family="Malgun Gothic", color="white"),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig, customdata, sim_sorted
+
+
+def build_crisis_tab_html(profiles: pd.DataFrame,
+                          scores: pd.DataFrame,
+                          similarity: pd.Series,
+                          crisis_returns: dict,
+                          fig_dtw: go.Figure = None) -> str:
+    """위기 국면 비교 분석 탭 전체 HTML
+    (코사인 유사도 막대 + 상시 상세 패널 + 수익률 표  /  DTW 유사도 타임라인)
+    """
+    fig, customdata, sim_sorted = build_crisis_bar_chart(profiles, scores, similarity)
+
+    cfg        = {"scrollZoom": False, "displayModeBar": False, "responsive": True}
+    chart_html = fig.to_html(full_html=False, include_plotlyjs=False, config=cfg)
+
+    # DTW 타임라인 HTML
+    if fig_dtw is not None:
+        dtw_cfg  = {"scrollZoom": True, "displayModeBar": True, "responsive": True}
+        dtw_html = fig_dtw.to_html(full_html=False, include_plotlyjs=False, config=dtw_cfg)
+    else:
+        dtw_html = "<div style='color:rgba(255,255,255,0.4);padding:20px;'>DTW 데이터를 불러오는 중 오류가 발생했습니다.</div>"
+
+    customdata_json   = json.dumps(customdata, ensure_ascii=False)
+    crisis_names_json = json.dumps(list(CRISIS_PERIODS_COMP.keys()), ensure_ascii=False)
+    colors_json       = json.dumps(CRISIS_COLORS_COMP)
+    returns_json      = json.dumps(crisis_returns, ensure_ascii=False)
+    asset_names_json  = json.dumps([name for _, name in RETURN_ASSETS], ensure_ascii=False)
+    # 초기 표시: 가장 유사도 높은 위기 (sim_sorted 마지막 = 최고)
+    initial_idx = len(customdata) - 1
+
+    # '현재' 구간 키 이름에 날짜가 이미 포함되어 있음 (예: "현재 (2026.01.01 ~ 2026.04.15)")
+    current_period_label = next((k for k in CRISIS_PERIODS_COMP if "현재" in k), "현재")
+
+    return f"""<div style="padding:20px 24px;background:#111;color:white;
+               font-family:'Malgun Gothic',Arial,sans-serif;min-height:100%;">
+
+  <!-- ── 제목 + 설명 ── -->
+  <div style="margin-bottom:18px;padding-bottom:14px;
+              border-bottom:1px solid rgba(255,255,255,0.1);">
+    <h2 style="margin:0 0 8px;font-size:22px;font-weight:bold;color:white;">
+      ⚠️ 현재 국면과 과거 위기 유사도
+    </h2>
+    <div style="display:inline-block;background:rgba(52,152,219,0.2);border:1px solid rgba(52,152,219,0.5);
+                border-radius:6px;padding:5px 14px;margin-bottom:10px;font-size:13px;">
+      📅 분석 기준 구간: <b style="color:#3498db;">{current_period_label}</b>
+    </div>
+    <p style="margin:0;color:rgba(255,255,255,0.55);font-size:13px;line-height:1.75;max-width:900px;">
+      현재 시장 지표 8개(VIX, 장단기금리차, HY스프레드, CPI, 실질금리, 달러인덱스, S&P500 전년비, 실업률)를
+      과거 6개 위기 구간의 평균 수준과 비교합니다.<br>
+      <b style="color:rgba(255,255,255,0.85);">측정 방법:</b>
+      각 지표를 전체 역사 분포에서 0~100점(백분위)으로 변환한 뒤,
+      현재 지표 벡터와 과거 위기 벡터 간의
+      <span style="color:#3498db;font-weight:bold;">코사인 유사도</span>를 산출합니다.
+      숫자가 클수록 절대 수준의 방향성이 유사한 시기입니다.
+      막대 위에 마우스를 올리거나 클릭하면 우측에서 지표별 상세 비교를 확인할 수 있습니다.
+    </p>
+  </div>
+
+  <!-- ── 막대그래프 + 상세 패널 ── -->
+  <div style="display:flex;gap:20px;align-items:flex-start;">
+
+    <!-- 막대그래프 -->
+    <div style="flex:1;min-width:0;">
+      {chart_html}
+    </div>
+
+    <!-- 상시 상세 패널 (지표 백분위) -->
+    <div id="crisis-detail-panel"
+         style="width:370px;flex-shrink:0;background:rgba(255,255,255,0.04);
+                border-radius:10px;padding:18px 16px;
+                border:1px solid rgba(255,255,255,0.12);min-height:360px;">
+      <div id="crisis-detail-content"
+           style="font-family:'Malgun Gothic',Arial,sans-serif;"></div>
+    </div>
+
+    <!-- 수익률 표 패널 -->
+    <div id="crisis-return-panel"
+         style="width:370px;flex-shrink:0;background:rgba(255,255,255,0.04);
+                border-radius:10px;padding:18px 16px;
+                border:1px solid rgba(255,255,255,0.12);min-height:360px;">
+      <div id="crisis-return-content"
+           style="font-family:'Malgun Gothic',Arial,sans-serif;"></div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+var CD_DATA        = {customdata_json};
+var CD_NAMES       = {crisis_names_json};
+var CD_COLORS_LIST = {colors_json};
+var CD_COLOR_MAP   = {{}};
+CD_NAMES.forEach(function(n,i){{ CD_COLOR_MAP[n] = CD_COLORS_LIST[i % CD_COLORS_LIST.length]; }});
+
+var CRISIS_RETURNS  = {returns_json};
+var RETURN_ASSETS   = {asset_names_json};
+
+function renderReturnTable(crisisName) {{
+  var barColor = CD_COLOR_MAP[crisisName] || '#95a5a6';
+  var data = CRISIS_RETURNS[crisisName] || {{}};
+  var periods = CRISIS_RETURNS;
+
+  // 구간 날짜 표시 (CD_NAMES에서 키 그대로 사용)
+  var html = '<div style="margin-bottom:12px;">'
+    + '<div style="font-size:14px;font-weight:bold;color:' + barColor
+    + ';margin-bottom:4px;">📊 기간 수익률</div>'
+    + '<div style="font-size:11px;color:rgba(255,255,255,0.45);">' + crisisName + '</div>'
+    + '</div>';
+
+  html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+  html += '<thead><tr style="border-bottom:1px solid rgba(255,255,255,0.15);">'
+    + '<th style="text-align:left;padding:6px 4px;color:rgba(255,255,255,0.45);'
+    + 'font-size:11px;font-weight:normal;">자산</th>'
+    + '<th style="text-align:right;padding:6px 4px;color:rgba(255,255,255,0.45);'
+    + 'font-size:11px;font-weight:normal;">수익률</th>'
+    + '</tr></thead><tbody>';
+
+  RETURN_ASSETS.forEach(function(name) {{
+    var val = data[name];
+    var retStr, retColor;
+    if (val === null || val === undefined) {{
+      retStr = 'N/A';
+      retColor = 'rgba(255,255,255,0.3)';
+    }} else {{
+      retStr  = (val >= 0 ? '+' : '') + val.toFixed(1) + '%';
+      retColor = val >= 0 ? '#2ecc71' : '#e74c3c';
+    }}
+    html += '<tr style="border-bottom:1px solid rgba(255,255,255,0.05);">'
+      + '<td style="padding:7px 4px;color:rgba(255,255,255,0.85);">' + name + '</td>'
+      + '<td style="padding:7px 4px;text-align:right;font-weight:bold;color:' + retColor + ';">'
+      + retStr + '</td>'
+      + '</tr>';
+  }});
+
+  html += '</tbody></table>';
+  document.getElementById('crisis-return-content').innerHTML = html;
+}}
+
+function renderCrisisDetail(cd) {{
+  var barColor = CD_COLOR_MAP[cd.crisis] || '#95a5a6';
+  var html = '<div style="margin-bottom:14px;">'
+    + '<div style="font-size:15px;font-weight:bold;color:' + barColor
+    + ';margin-bottom:5px;">📌 ' + cd.crisis + '</div>'
+    + '<div style="font-size:12px;color:rgba(255,255,255,0.5);">현재와의 코사인 유사도: '
+    + '<b style=\\"color:white;\\">' + cd.sim.toFixed(1) + '%</b></div>'
+    + '</div>';
+
+  html += '<div style="font-size:10px;color:rgba(255,255,255,0.35);'
+    + 'margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.1);">'
+    + '현재(백분위점) / 당시(백분위점) &nbsp;|&nbsp; 괄호 안은 실제 수치</div>';
+
+  html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+  html += '<thead><tr style="border-bottom:1px solid rgba(255,255,255,0.15);">'
+    + '<th style="text-align:left;padding:5px 4px;color:rgba(255,255,255,0.45);'
+    + 'font-size:11px;font-weight:normal;">지표</th>'
+    + '<th style="text-align:center;padding:5px 4px;color:rgba(255,255,255,0.45);'
+    + 'font-size:11px;font-weight:normal;">현재</th>'
+    + '<th style="text-align:center;padding:5px 4px;color:rgba(255,255,255,0.45);'
+    + 'font-size:11px;font-weight:normal;">당시</th>'
+    + '<th style="text-align:center;padding:5px 4px;color:rgba(255,255,255,0.45);'
+    + 'font-size:11px;font-weight:normal;">비교</th>'
+    + '</tr></thead><tbody>';
+
+  // 지표별 시장 우호 방향 정의
+  // true  = 수치가 높을수록 시장에 좋음 (높음→초록, 낮음→빨간)
+  // false = 수치가 높을수록 시장에 나쁨 (높음→빨간, 낮음→초록)
+  var IND_HIGH_IS_GOOD = {{
+    'VIX':                  false,
+    '장단기금리차(10Y-2Y)': true,
+    'HY크레딧스프레드':     false,
+    '미국CPI':              false,
+    '실질금리TIPS10Y':      false,
+    '달러인덱스DXY':        false,
+    'SP500(전년비%)':       true,
+    '미국실업률':           false,
+  }};
+
+  cd.indicators.forEach(function(ind) {{
+    if (ind.cur_pct === null && ind.cri_pct === null) return;
+    var diff = (ind.cur_pct !== null && ind.cri_pct !== null)
+               ? (ind.cur_pct - ind.cri_pct) : null;
+
+    var diffStr;
+    if (diff === null) {{
+      diffStr = '<span style="color:rgba(255,255,255,0.3);">-</span>';
+    }} else if (Math.abs(diff) <= 5) {{
+      diffStr = '<span style="color:#f39c12;">≈ 유사</span>';
+    }} else {{
+      // 현재가 당시보다 높은지(diff>5) 낮은지(diff<-5)
+      var isHigh = diff > 5;
+      // 해당 방향이 시장에 우호적인지 판단
+      var highIsGood = (ind.name in IND_HIGH_IS_GOOD) ? IND_HIGH_IS_GOOD[ind.name] : null;
+      var goodForMarket = (highIsGood === null) ? null : (isHigh ? highIsGood : !highIsGood);
+      var col   = goodForMarket === null ? '#f39c12'
+                : goodForMarket ? '#2ecc71' : '#e74c3c';
+      var arrow = isHigh ? '▲ 높음' : '▼ 낮음';
+      diffStr = '<span style="color:' + col + ';font-weight:bold;">' + arrow + '</span>';
+    }}
+
+    var curPct = ind.cur_pct !== null
+      ? '<span style="color:#ecf0f1;">' + ind.cur_pct.toFixed(0) + '점</span>' : 'N/A';
+    var criPct = ind.cri_pct !== null
+      ? '<span style="color:#ecf0f1;">' + ind.cri_pct.toFixed(0) + '점</span>' : 'N/A';
+    var curRaw = ind.cur_raw !== null
+      ? '<div style="color:rgba(255,255,255,0.38);font-size:10px;">(' + ind.cur_raw + ')</div>' : '';
+    var criRaw = ind.cri_raw !== null
+      ? '<div style="color:rgba(255,255,255,0.38);font-size:10px;">(' + ind.cri_raw + ')</div>' : '';
+
+    html += '<tr style="border-bottom:1px solid rgba(255,255,255,0.05);">'
+      + '<td style="padding:6px 4px;color:rgba(255,255,255,0.85);">' + ind.name + '</td>'
+      + '<td style="padding:6px 4px;text-align:center;">' + curPct + curRaw + '</td>'
+      + '<td style="padding:6px 4px;text-align:center;">' + criPct + criRaw + '</td>'
+      + '<td style="padding:6px 4px;text-align:center;">' + diffStr + '</td>'
+      + '</tr>';
+  }});
+
+  html += '</tbody></table>';
+  document.getElementById('crisis-detail-content').innerHTML = html;
+}}
+
+// 초기: 가장 유사도 높은 위기 표시
+if (CD_DATA.length > 0) {{
+  renderCrisisDetail(CD_DATA[{initial_idx}]);
+  renderReturnTable(CD_DATA[{initial_idx}].crisis);
+}}
+
+// 막대 hover/click 시 두 패널 동시 업데이트
+window.addEventListener('load', function() {{
+  setTimeout(function() {{
+    var container = document.getElementById('crisis');
+    var gds = container
+      ? container.querySelectorAll('.plotly-graph-div')
+      : document.querySelectorAll('.plotly-graph-div');
+    gds.forEach(function(gd) {{
+      gd.on('plotly_hover', function(data) {{
+        var pt = data.points && data.points[0];
+        if (pt && pt.customdata && pt.customdata.indicators) {{
+          renderCrisisDetail(pt.customdata);
+          renderReturnTable(pt.customdata.crisis);
+        }}
+      }});
+      gd.on('plotly_click', function(data) {{
+        var pt = data.points && data.points[0];
+        if (pt && pt.customdata && pt.customdata.indicators) {{
+          renderCrisisDetail(pt.customdata);
+          renderReturnTable(pt.customdata.crisis);
+        }}
+      }});
+    }});
+  }}, 800);
+}});
+</script>
+
+<!-- ══════════════════════════════════════════════════════════ -->
+<!-- DTW 유사도 타임라인 섹션 -->
+<!-- ══════════════════════════════════════════════════════════ -->
+<div style="margin-top:36px;padding-top:24px;
+            border-top:2px solid rgba(255,255,255,0.12);
+            padding-left:24px;padding-right:24px;padding-bottom:24px;">
+
+  <div style="margin-bottom:16px;padding-bottom:12px;
+              border-bottom:1px solid rgba(255,255,255,0.08);">
+    <h2 style="margin:0 0 8px;font-size:20px;font-weight:bold;color:white;">
+      🔍 DTW 유사도 타임라인
+    </h2>
+    <p style="margin:0;color:rgba(255,255,255,0.55);font-size:13px;line-height:1.75;max-width:900px;">
+      코사인 유사도가 단일 시점의 절대 수준을 비교하는 것과 달리,
+      <span style="color:#3498db;font-weight:bold;">DTW(Dynamic Time Warping)</span>는
+      현재 직전 <b style="color:rgba(255,255,255,0.85);">{DTW_WINDOW}개월 지표 궤적</b>(변화의 방향·속도)을
+      과거 모든 구간과 비교해 <b>패턴이 유사한 과거 구간</b>을 찾습니다.<br>
+      음영 처리된 구간이 현재와 가장 유사한 과거 패턴입니다.
+      절대 레벨(금리 몇 %냐)이 아닌 <em>움직임의 형태</em>가 유사한 시기를 탐색합니다.
+    </p>
+  </div>
+
+  <div id="dtw-chart-container" style="width:100%;min-height:520px;">
+    {dtw_html}
+  </div>
+
+</div>
+<script>
+(function() {{
+  // DTW 그래프가 컨테이너 너비에 맞게 자동 리사이즈
+  function resizeDtw() {{
+    var container = document.getElementById('dtw-chart-container');
+    if (!container) return;
+    var gd = container.querySelector('.plotly-graph-div');
+    if (gd) {{
+      Plotly.relayout(gd, {{
+        width: container.offsetWidth,
+        autosize: true
+      }});
+    }}
+  }}
+  // 탭 전환 시 및 창 크기 변경 시 리사이즈
+  window.addEventListener('load', function() {{ setTimeout(resizeDtw, 400); }});
+  window.addEventListener('resize', resizeDtw);
+  // 탭2(위기분석) 버튼 클릭 시도 감지
+  document.addEventListener('click', function(e) {{
+    if (e.target && e.target.classList && e.target.classList.contains('tab-btn')) {{
+      setTimeout(resizeDtw, 300);
+    }}
+  }});
+}})();
+</script>
+"""
+
+
+# =====================================
+# HTML 합치기 (탭 구성)
+# =====================================
+def combine_to_html(fig_heatmap: go.Figure,
+                    html_crisis: str, output_path: str,
+                    html_dashboard: str = ""):
+    cfg = {"scrollZoom": True, "displayModeBar": True, "responsive": True}
+    html_heatmap = fig_heatmap.to_html(full_html=False, include_plotlyjs=False, config=cfg)
+
+    has_dash = bool(html_dashboard)
+
+    tab_html = f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>자산 성과 분석</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; }}
+  html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; background: #111111;
+    font-family: 'Malgun Gothic', Arial, sans-serif; }}
+  .tab-bar {{ display: flex; background: #1a1a2e; padding: 8px 16px 0; gap: 4px;
+    border-bottom: 2px solid #2c3e50; position: sticky; top: 0; z-index: 100; }}
+  .tab-btn {{
+    padding: 10px 24px; cursor: grab; border: none; border-radius: 6px 6px 0 0;
+    background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.7); font-size:16px;
+    font-family: 'Malgun Gothic', Arial, sans-serif; transition: background 0.2s;
+    user-select: none;
+  }}
+  .tab-btn:hover {{ background: rgba(255,255,255,0.15); color: white; }}
+  .tab-btn.active {{ background: #111111; color: white; font-weight: bold;
+    border-bottom: 2px solid #111111; margin-bottom: -2px; }}
+  .tab-btn.dragging {{ opacity: 0.4; cursor: grabbing; }}
+  .tab-btn.drag-over {{ background: rgba(255,255,255,0.28); color: white;
+    outline: 2px dashed rgba(255,255,255,0.5); outline-offset: -2px; }}
+  .tab-content {{ display: none; background: #111111; width: 100%; }}
+  .tab-content.active {{ display: block; }}
+  .tab-content.padded {{ padding: 16px; }}
+  .tab-content.dashboard-tab {{ padding: 0; height: calc(100vh - 50px); overflow: hidden; }}
+  .tab-content .plotly-graph-div {{ width: 100% !important; }}
+</style>
+</head>
+<body>
+<div class="tab-bar">
+  {'<button class="tab-btn active" onclick="showTab(\'dashboard\', this)">📈 시장 대시보드</button>' if has_dash else ''}
+  <button class="tab-btn {'active' if not has_dash else ''}" onclick="showTab('crisis', this)">⚠️ 위기 국면 비교 분석</button>
+  <button class="tab-btn" onclick="showTab('heatmap', this)">📅 월별 수익률 히트맵</button>
+</div>
+{'<div id="dashboard" class="tab-content dashboard-tab active">' + html_dashboard + '</div>' if has_dash else ''}
+<div id="crisis"  class="tab-content {'active' if not has_dash else ''}">{html_crisis}</div>
+<div id="heatmap" class="tab-content padded">{html_heatmap}</div>
+<script>
+function showTab(id, btn) {{
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
+  var gd = document.querySelector('#' + id + ' .plotly-graph-div')
+    || document.querySelector('#' + id + ' #chart-area .plotly-graph-div');
+  if (gd) {{ Plotly.relayout(gd, {{autosize: true}}); }}
+}}
+
+(function() {{
+  var dragSrc = null;
+  function onDragStart(e) {{
+    dragSrc = this; this.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', '');
+  }}
+  function onDragEnd() {{
+    dragSrc && dragSrc.classList.remove('dragging');
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('drag-over'));
+    dragSrc = null;
+  }}
+  function onDragOver(e) {{
+    e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('drag-over'));
+    if (this !== dragSrc) this.classList.add('drag-over');
+  }}
+  function onDrop(e) {{
+    e.stopPropagation();
+    if (!dragSrc || dragSrc === this) return;
+    var bar = document.querySelector('.tab-bar');
+    var btns = Array.from(bar.querySelectorAll('.tab-btn'));
+    var srcIdx = btns.indexOf(dragSrc);
+    var dstIdx = btns.indexOf(this);
+    if (srcIdx < dstIdx) bar.insertBefore(dragSrc, this.nextSibling);
+    else bar.insertBefore(dragSrc, this);
+  }}
+  function initDrag() {{
+    document.querySelectorAll('.tab-btn').forEach(function(btn) {{
+      btn.setAttribute('draggable', 'true');
+      btn.addEventListener('dragstart', onDragStart);
+      btn.addEventListener('dragend',   onDragEnd);
+      btn.addEventListener('dragover',  onDragOver);
+      btn.addEventListener('drop',      onDrop);
+    }});
+  }}
+  window.addEventListener('load', initDrag);
+}})();
+</script>
+</body>
+</html>"""
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(tab_html)
+
+
+# =====================================
+# 메인
+# =====================================
+def main():
+    print("===== 시각화_03_v3 (02 + 04 통합) 시작 =====\n")
+
+    print("[1/8] 자산 가격 데이터 로드...")
+    asset_df = build_asset_df()
+    print(f"      기간: {asset_df.index[0].date()} ~ {asset_df.index[-1].date()}")
+    print(f"      컬럼: {asset_df.columns.tolist()}")
+
+    print("[2/8] 월별 수익률 계산...")
+    monthly_ret = compute_monthly_returns(asset_df)
+    available = [c for c, _ in ASSET_LIST if c in monthly_ret.columns]
+    print(f"      사용 가능 자산 ({len(available)}개): {available}")
+
+    print("[3/8] 국면 시계열 로드...")
+    regime_monthly = load_regime_monthly()
+    print(f"      국면 데이터: {len(regime_monthly)}개월")
+
+    print("[4/8] 히트맵 차트 생성...")
+    fig_heatmap = build_heatmap_html(monthly_ret, regime_monthly)
+
+    print("[5/8] 위기 국면 비교 분석 (코사인 유사도) 계산...")
+    df_crisis  = load_crisis_data()
+    # 원데이터 마지막 날짜로 '현재' 구간 라벨 갱신
+    global CRISIS_PERIODS_COMP, CRISIS_HOVER_INFO
+    CRISIS_PERIODS_COMP = _make_crisis_periods_comp(df_crisis.index[-1].strftime("%Y.%m.%d"))
+    # 2026~ 현재 구간 hover 텍스트를 실데이터 기반으로 갱신
+    CRISIS_HOVER_INFO["현재(2026~)"] = _build_current_hover_info(df_crisis)
+    print(f"      현재 국면 호버 텍스트 갱신 완료 ({df_crisis.index[-1].strftime('%Y.%m.%d')} 기준)")
+    profiles       = compute_crisis_profiles(df_crisis)
+    scores         = compute_percentile_scores(df_crisis, profiles)
+    similarity     = compute_similarity(scores)
+    crisis_returns = compute_crisis_returns(df_crisis)
+
+    print("[7/8] DTW 유사도 타임라인 계산...")
+    fig_dtw = None
+    try:
+        dtw_monthly   = dtw_load_indicator_data()
+        dtw_ind_mat   = dtw_build_indicator_matrix(dtw_monthly)
+        dtw_asset_df  = dtw_monthly[[col for col, _ in [
+            ("SP500",""), ("NASDAQ100",""), ("금현물가격",""), ("달러인덱스DXY",""),
+            ("미국7-10년국채TR",""), ("미국HY채권TR",""), ("WTI원유",""),
+        ] if col in dtw_monthly.columns]].copy()
+        dtw_scores    = dtw_compute_percentile_matrix(dtw_ind_mat)
+        dtw_sim       = compute_dtw_similarity(dtw_scores)
+        dtw_top       = dtw_get_top_similar(dtw_sim, DTW_TOP_N)
+        fig_dtw       = build_dtw_timeline(dtw_sim, dtw_top, dtw_scores, dtw_asset_df)
+        print(f"      DTW 상위 {DTW_TOP_N}개 유사 구간 탐색 완료")
+        for i, (date, sim_val) in enumerate(dtw_top.items()):
+            print(f"      #{i+1}  {date.strftime('%Y년 %m월')}  유사도: {sim_val:.1f}%")
+    except Exception as e:
+        print(f"      [경고] DTW 계산 실패: {e}")
+
+    html_crisis = build_crisis_tab_html(profiles, scores, similarity, crisis_returns, fig_dtw)
+
+    print("[8/8] 시장 대시보드 탭 생성...")
+    html_dashboard = ""
+    try:
+        df_dash  = load_data()
+        idx_dash = load_index_data()
+        html_dashboard = get_tab_embed_html(df_dash, idx_dash)
+        print("      대시보드 탭 생성 완료")
+    except Exception as e:
+        print(f"      [경고] 대시보드 탭 생성 실패: {e}")
+
+    print(f"\nHTML 저장 중... ({OUTPUT_PATH})")
+    combine_to_html(fig_heatmap, html_crisis, OUTPUT_PATH, html_dashboard)
+    print(f"[완료] 저장: {OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    main()
