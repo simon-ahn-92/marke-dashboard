@@ -1,0 +1,550 @@
+# -*- coding: utf-8 -*-
+"""
+ETF 목록 엑셀 저장
+- CAGR(연환산)          : EODHD API (월별 adjusted_close 기준)
+- AUM(억달러), 상장연도,
+  운용보수(%)           : stockanalysis.com 스크래핑 (curl_cffi)
+- 별점, 선정이유        : 수동 입력 (editorial)
+저장 경로: C:\\python\\성일\\국면판단 모델\\ETF_목록.xlsx
+"""
+import re
+import time
+import warnings
+
+import numpy as np
+import pandas as pd
+import requests
+from curl_cffi import requests as cf
+
+warnings.filterwarnings("ignore")
+requests.packages.urllib3.disable_warnings()
+
+OUTPUT = r"C:\python\성일\국면판단 모델\ETF_목록.xlsx"
+TOKEN  = "69db6513a3c116.22375919"
+
+
+# ══════════════════════════════════════════════════════════════
+# 1. 데이터 수집 함수
+# ══════════════════════════════════════════════════════════════
+
+def fetch_eodhd(ticker: str, retries: int = 3) -> float | None:
+    """EODHD 월별 adjusted_close -> CAGR(%)
+    rate limit 대비 최대 retries회 재시도.
+    """
+    url = (f"https://eodhd.com/api/eod/{ticker}.US"
+           f"?api_token={TOKEN}&fmt=json&period=m")
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, verify=False, timeout=15)
+            if r.status_code == 429:
+                time.sleep(2 * (attempt + 1))
+                continue
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            if not data or len(data) < 2:
+                if attempt < retries - 1:
+                    time.sleep(1)
+                    continue
+                return None
+            prices = [d["adjusted_close"] for d in data if d.get("adjusted_close")]
+            if len(prices) < 2:
+                return None
+            p_first, p_last = prices[0], prices[-1]
+            years = len(prices) / 12.0
+            if p_first <= 0 or years < 0.5:
+                return None
+            return round(((p_last / p_first) ** (1 / years) - 1) * 100, 2)
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(1)
+    return None
+
+
+def fetch_stockanalysis(ticker: str) -> tuple:
+    """stockanalysis.com -> (AUM 억달러, 상장연도, 운용보수%)"""
+    url = f"https://stockanalysis.com/etf/{ticker.lower()}/"
+    try:
+        r = cf.get(url, impersonate="chrome110", verify=False, timeout=15)
+        if r.status_code != 200:
+            return None, None, None
+        text = r.text
+
+        # AUM
+        aum = None
+        m = re.search(r">Assets</td><td[^>]*>(.*?)</td>", text)
+        if m:
+            raw = m.group(1).strip()
+            nm = re.match(r"[\$]?([\d,]+\.?\d*)\s*([BMKTbmkt]?)", raw.replace(",", ""))
+            if nm:
+                num, unit = float(nm.group(1)), nm.group(2).upper()
+                # 1B = 10억달러, 1M = 0.01억달러
+                if unit == "B":
+                    aum = round(num * 10, 1)
+                elif unit == "M":
+                    aum = round(num / 100, 2)
+                elif unit == "T":
+                    aum = round(num * 10000, 0)
+                else:
+                    aum = round(num, 1)
+
+        # 상장연도
+        year = None
+        m2 = re.search(r">Inception Date</td><td[^>]*>(.*?)</td>", text)
+        if m2:
+            yr = re.search(r"(\d{4})", m2.group(1))
+            if yr:
+                year = int(yr.group(1))
+
+        # 운용보수
+        expense = None
+        m3 = re.search(r">Expense Ratio</td><td[^>]*>(.*?)</td>", text)
+        if m3:
+            em = re.search(r"([\d.]+)%", m3.group(1))
+            if em:
+                expense = float(em.group(1))
+
+        return aum, year, expense
+    except Exception:
+        return None, None, None
+
+
+# ══════════════════════════════════════════════════════════════
+# 2. ETF 데이터 정의
+#    컬럼: 티커, ETF명, 분류/테마/유형, [만기구분,] 추종지수, 별점, 선정이유
+#    AUM·상장연도·CAGR·운용보수는 자동 수집 후 삽입
+# ══════════════════════════════════════════════════════════════
+
+# ── 인덱스형 ─────────────────────────────────────────────────
+idx = [
+    # 미국 전체시장
+    ("VTI",  "Vanguard Total Stock Market ETF",               "미국 전체시장",    "CRSP US Total Market",                5, "미국 전체시장 AUM 1위, 최저보수"),
+    ("ITOT", "iShares Core S&P Total US Stock Market ETF",   "미국 전체시장",    "S&P Total Market",                    5, "미국 전체시장 AUM 2위"),
+    ("SCHB", "Schwab U.S. Broad Market ETF",                 "미국 전체시장",    "DJ US Broad Stock Market",            5, "미국 전체시장 AUM 3위"),
+    # S&P500
+    ("VOO",  "Vanguard S&P 500 ETF",                         "S&P500",           "S&P 500",                             5, "S&P500 AUM 1위, 뱅가드 대표"),
+    ("IVV",  "iShares Core S&P 500 ETF",                     "S&P500",           "S&P 500",                             5, "S&P500 AUM 2위, 최저보수"),
+    ("SPY",  "SPDR S&P 500 ETF Trust",                       "S&P500",           "S&P 500",                             5, "세계 최대 ETF, 유동성 1위"),
+    # 대형주
+    ("VV",   "Vanguard Large-Cap ETF",                       "미국 대형주",      "CRSP US Large Cap",                   5, "CRSP 대형주 대표"),
+    ("IWB",  "iShares Russell 1000 ETF",                     "미국 대형주",      "Russell 1000",                        5, "러셀1000 AUM 1위"),
+    ("SCHX", "Schwab U.S. Large-Cap ETF",                    "미국 대형주",      "DJ US Large-Cap Total",               5, "슈왑 대형주 최저보수"),
+    # 중형주
+    ("IJH",  "iShares Core S&P Mid-Cap ETF",                 "미국 중형주",      "S&P MidCap 400",                      5, "중형주 AUM 1위"),
+    ("VO",   "Vanguard Mid-Cap ETF",                         "미국 중형주",      "CRSP US Mid Cap",                     5, "중형주 AUM 2위"),
+    ("MDY",  "SPDR S&P MidCap 400 ETF Trust",                "미국 중형주",      "S&P MidCap 400",                      4, "중형주 최장기 상장"),
+    # 소형주
+    ("IJR",  "iShares Core S&P Small-Cap ETF",               "미국 소형주",      "S&P SmallCap 600",                    5, "소형주 AUM 1위"),
+    ("VB",   "Vanguard Small-Cap ETF",                       "미국 소형주",      "CRSP US Small Cap",                   5, "소형주 AUM 2위"),
+    ("IWM",  "iShares Russell 2000 ETF",                     "미국 소형주",      "Russell 2000",                        4, "소형주 최고 유동성"),
+    # 성장주
+    ("VUG",  "Vanguard Growth ETF",                          "미국 성장주",      "CRSP US Large Cap Growth",            5, "성장주 AUM 1위"),
+    ("QQQ",  "Invesco QQQ Trust",                            "미국 성장주",      "Nasdaq-100",                          5, "나스닥100 AUM 1위"),
+    ("IWF",  "iShares Russell 1000 Growth ETF",              "미국 성장주",      "Russell 1000 Growth",                 5, "러셀 성장주 AUM 1위"),
+    # 가치주
+    ("VTV",  "Vanguard Value ETF",                           "미국 가치주",      "CRSP US Large Cap Value",             5, "가치주 AUM 1위"),
+    ("IWD",  "iShares Russell 1000 Value ETF",               "미국 가치주",      "Russell 1000 Value",                  5, "러셀 가치주 AUM 1위"),
+    ("IVE",  "iShares S&P 500 Value ETF",                    "미국 가치주",      "S&P 500 Value",                       4, "S&P500 가치주 AUM 1위"),
+    # 선진국 (미국 제외)
+    ("VEA",  "Vanguard FTSE Developed Markets ETF",          "선진국(미국제외)", "FTSE Developed ex US",                4, "선진국 AUM 1위, 최저보수"),
+    ("EFA",  "iShares MSCI EAFE ETF",                        "선진국(미국제외)", "MSCI EAFE",                           3, "EAFE 유동성 1위"),
+    ("IDEV", "iShares Core MSCI Intl Developed Markets ETF", "선진국(미국제외)", "MSCI World ex USA IMI",               4, "최저보수 선진국"),
+    # 유럽
+    ("VGK",  "Vanguard FTSE Europe ETF",                     "유럽",             "FTSE Developed Europe",               3, "유럽 AUM 1위"),
+    ("FEZ",  "SPDR Euro Stoxx 50 ETF",                       "유럽",             "Euro Stoxx 50",                       3, "유로존 블루칩 대표"),
+    ("IEV",  "iShares Europe ETF",                           "유럽",             "S&P Europe 350",                      3, "유럽 S&P 지수"),
+    # 일본
+    ("EWJ",  "iShares MSCI Japan ETF",                       "일본",             "MSCI Japan",                          3, "일본 단일국가 AUM 1위"),
+    ("DXJ",  "WisdomTree Japan Hedged Equity Fund",          "일본",             "WisdomTree Japan Hedged",             3, "엔화 헤지 일본 주식"),
+    ("HEWJ", "iShares Currency Hedged MSCI Japan ETF",       "일본",             "MSCI Japan USD Hedged",               3, "MSCI 기반 엔화 헤지"),
+    # 신흥국
+    ("VWO",  "Vanguard FTSE Emerging Markets ETF",           "신흥국",           "FTSE Emerging Markets",               4, "신흥국 AUM 1위, 최저보수"),
+    ("IEMG", "iShares Core MSCI Emerging Markets ETF",       "신흥국",           "MSCI EM IMI",                         4, "신흥국 AUM 2위, 저보수"),
+    ("EEM",  "iShares MSCI Emerging Markets ETF",            "신흥국",           "MSCI Emerging Markets",               3, "신흥국 유동성 1위"),
+    # 중국
+    ("FXI",  "iShares China Large-Cap ETF",                  "중국",             "FTSE China 50",                       3, "중국 대형주 AUM 1위"),
+    ("MCHI", "iShares MSCI China ETF",                       "중국",             "MSCI China",                          3, "MSCI 중국 AUM 1위"),
+    ("KWEB", "KraneShares CSI China Internet ETF",           "중국",             "CSI Overseas China Internet",         3, "중국 인터넷 대표"),
+    # 한국
+    ("EWY",  "iShares MSCI South Korea ETF",                 "한국",             "MSCI Korea 25/50",                    3, "한국 단일국가 대표"),
+    # 글로벌 전체
+    ("VT",   "Vanguard Total World Stock ETF",               "글로벌 전체",      "FTSE Global All Cap",                 5, "전세계 주식 AUM 1위"),
+    ("ACWI", "iShares MSCI ACWI ETF",                        "글로벌 전체",      "MSCI ACWI",                           4, "MSCI 전세계 대표"),
+    ("URTH", "iShares MSCI World ETF",                       "글로벌 전체",      "MSCI World (선진국)",                 4, "선진국 전체(신흥국 제외)"),
+]
+df_idx = pd.DataFrame(idx, columns=["티커","ETF명","분류","추종지수","별점(5점)","선정이유"])
+df_idx = df_idx.drop_duplicates(subset=["티커"], keep="first").reset_index(drop=True)
+
+# ── 테마형 ─────────────────────────────────────────────────
+theme = [
+    ("SOXX", "iShares Semiconductor ETF",                    "반도체",            "ICE Semiconductor",                   4, "반도체 AUM 1위"),
+    ("SMH",  "VanEck Semiconductor ETF",                     "반도체",            "MVIS US Listed Semiconductor",        4, "반도체 AUM 2위, 유동성 최우수"),
+    ("PSI",  "Invesco Dynamic Semiconductors ETF",           "반도체",            "Dynamic Semiconductor Intellidex",    3, "반도체 동적 선정 전략"),
+    ("BOTZ", "Global X Robotics & AI ETF",                   "AI/기술",           "Indxx Global Robotics & AI",          3, "AI·로봇 복합 AUM 1위"),
+    ("AIQ",  "Global X AI & Technology ETF",                 "AI/기술",           "Indxx AI & Big Data",                 3, "AI 테마 대표"),
+    ("ARKK", "ARK Innovation ETF",                           "AI/기술",           "Active (AI·유전체·핀테크)",            3, "혁신 액티브 ETF 대표"),
+    ("SKYY", "First Trust Cloud Computing ETF",              "클라우드/소프트웨어","ISE CTA Cloud Computing",             3, "클라우드 최장기 상장"),
+    ("WCLD", "WisdomTree Cloud Computing Fund",              "클라우드/소프트웨어","BVP Nasdaq Emerging Cloud",           3, "클라우드 순수 AUM 1위"),
+    ("CLOU", "Global X Cloud Computing ETF",                 "클라우드/소프트웨어","Indxx Global Cloud Computing",        3, "글로벌 클라우드 테마"),
+    ("CIBR", "First Trust Nasdaq Cybersecurity ETF",         "사이버보안",         "Nasdaq CTA Cybersecurity",            4, "사이버보안 AUM 1위"),
+    ("HACK", "ETFMG Prime Cyber Security ETF",               "사이버보안",         "Prime Cyber Defense",                 3, "사이버보안 최초 상장"),
+    ("BUG",  "Global X Cybersecurity ETF",                   "사이버보안",         "Indxx Cybersecurity",                 3, "저보수 사이버보안"),
+    ("ICLN", "iShares Global Clean Energy ETF",              "청정에너지/태양광",  "S&P Global Clean Energy",             3, "청정에너지 AUM 1위"),
+    ("QCLN", "First Trust NASDAQ Clean Edge Green Energy",   "청정에너지/태양광",  "NASDAQ Clean Edge Green Energy",      3, "나스닥 청정에너지"),
+    ("TAN",  "Invesco Solar ETF",                            "청정에너지/태양광",  "MAC Global Solar Energy",             3, "태양광 순수 AUM 1위"),
+    ("DRIV", "Global X Autonomous & Electric Vehicles ETF",  "전기차",             "Solactive Autonomous & EV",           3, "전기차·자율주행 복합"),
+    ("IDRV", "iShares Self-Driving EV and Tech ETF",         "전기차",             "NYSE FactSet Global EV",              3, "저보수 전기차"),
+    ("KARS", "KraneShares Electric Vehicles ETF",            "전기차",             "Bloomberg Electric Vehicles",         3, "글로벌 전기차 공급망"),
+    ("XBI",  "SPDR S&P Biotech ETF",                         "바이오테크",         "S&P Biotechnology Select Industry",   3, "바이오테크 AUM 1위, 동일가중"),
+    ("IBB",  "iShares Biotechnology ETF",                    "바이오테크",         "ICE Biotechnology",                   3, "바이오테크 AUM 2위, 시총가중"),
+    ("ARKG", "ARK Genomic Revolution ETF",                   "바이오테크",         "Active (유전체·바이오)",               3, "유전체 혁신 액티브"),
+    ("XLV",  "Health Care Select Sector SPDR Fund",          "헬스케어",           "Health Care Select Sector",           4, "헬스케어 AUM 1위"),
+    ("VHT",  "Vanguard Health Care ETF",                     "헬스케어",           "MSCI US IMI Health Care",             5, "헬스케어 저보수 AUM 2위"),
+    ("IYH",  "iShares U.S. Healthcare ETF",                  "헬스케어",           "DJ U.S. Health Care",                 4, "다우존스 헬스케어"),
+    ("XLF",  "Financial Select Sector SPDR Fund",            "금융",               "Financial Select Sector",             4, "금융 AUM 1위"),
+    ("VFH",  "Vanguard Financials ETF",                      "금융",               "MSCI US IMI Financials",              5, "금융 저보수 AUM 2위"),
+    ("IYF",  "iShares U.S. Financials ETF",                  "금융",               "DJ U.S. Financials",                  4, "다우존스 금융"),
+    ("VNQ",  "Vanguard Real Estate ETF",                     "부동산(리츠)",        "MSCI US IMI Real Estate",             3, "리츠 AUM 1위"),
+    ("SCHH", "Schwab U.S. REIT ETF",                         "부동산(리츠)",        "DJ U.S. Select REIT",                 3, "리츠 최저보수"),
+    ("IYR",  "iShares U.S. Real Estate ETF",                 "부동산(리츠)",        "DJ U.S. Real Estate",                 3, "리츠 AUM 3위, 유동성 우수"),
+    ("XLP",  "Consumer Staples Select Sector SPDR Fund",     "필수소비재",          "Consumer Staples Select Sector",      4, "필수소비재 AUM 1위"),
+    ("VDC",  "Vanguard Consumer Staples ETF",                "필수소비재",          "MSCI US IMI Consumer Staples",        5, "필수소비재 저보수 AUM 2위"),
+    ("KXI",  "iShares Global Consumer Staples ETF",          "필수소비재",          "S&P Global Consumer Staples",         3, "글로벌 필수소비재"),
+    ("XLY",  "Consumer Discretionary Select Sector SPDR",    "임의소비재",          "Consumer Discretionary Select",       3, "임의소비재 AUM 1위"),
+    ("VCR",  "Vanguard Consumer Discretionary ETF",          "임의소비재",          "MSCI US IMI Consumer Disc.",          3, "임의소비재 저보수"),
+    ("XLI",  "Industrial Select Sector SPDR Fund",           "산업재",             "Industrial Select Sector",            4, "산업재 AUM 1위"),
+    ("VIS",  "Vanguard Industrials ETF",                     "산업재",             "MSCI US IMI Industrials",             5, "산업재 저보수 AUM 2위"),
+    ("IYJ",  "iShares U.S. Industrials ETF",                 "산업재",             "DJ U.S. Industrials",                 4, "다우존스 산업재"),
+    ("ITA",  "iShares U.S. Aerospace & Defense ETF",         "방위/항공우주",       "DJ U.S. Aerospace & Defense",         4, "방위·항공 AUM 1위"),
+    ("XAR",  "SPDR S&P Aerospace & Defense ETF",             "방위/항공우주",       "S&P Aerospace & Defense Select",      4, "동일가중 방위·항공"),
+    ("PPA",  "Invesco Aerospace & Defense ETF",              "방위/항공우주",       "SPADE Defense",                       4, "방위 특화 AUM 3위"),
+    ("GDX",  "VanEck Gold Miners ETF",                       "원자재/광업",         "NYSE Arca Gold Miners",               3, "금광주 AUM 1위"),
+    ("XME",  "SPDR S&P Metals & Mining ETF",                 "원자재/광업",         "S&P Metals & Mining Select",          3, "금속·광업 동일가중"),
+    ("PICK", "iShares MSCI Global Metals & Mining ETF",      "원자재/광업",         "MSCI ACWI Metals & Mining",           3, "글로벌 광업"),
+    ("PHO",  "Invesco Water Resources ETF",                  "수자원",             "NASDAQ OMX US Water",                 4, "수자원 AUM 1위"),
+    ("FIW",  "First Trust Water ETF",                        "수자원",             "ISE Clean Edge Water",                4, "수자원 AUM 2위"),
+    ("CGW",  "Invesco S&P Global Water ETF",                 "수자원",             "S&P Global Water",                    3, "글로벌 수자원"),
+    ("PAVE", "Global X U.S. Infrastructure Development ETF", "인프라",             "Indxx U.S. Infrastructure Dev.",      4, "인프라 AUM 1위"),
+    ("IGF",  "iShares Global Infrastructure ETF",            "인프라",             "FTSE Global Core Infrastructure",     4, "글로벌 인프라 AUM 1위"),
+    ("IFRA", "iShares U.S. Infrastructure ETF",              "인프라",             "NYSE FactSet U.S. Infrastructure",    3, "저보수 미국 인프라"),
+    ("ROBO", "ROBO Global Robotics & Automation ETF",        "로봇/자동화",         "ROBO Global Robotics & Automation",   3, "로봇·자동화 최초 상장"),
+    ("IRBO", "iShares Robotics & AI Multisector ETF",        "로봇/자동화",         "NYSE FactSet Global Robotics & AI",   3, "저보수 로봇·AI"),
+]
+df_theme = pd.DataFrame(theme, columns=["티커","ETF명","테마","추종지수","별점(5점)","선정이유"])
+df_theme = df_theme.drop_duplicates(subset=["티커"], keep="first").reset_index(drop=True)
+
+# ── 대체형 ─────────────────────────────────────────────────
+alt = [
+    ("GLD",  "SPDR Gold Shares",                             "금",                "금 현물",                             4, "금 ETF AUM 1위, 최대 유동성"),
+    ("IAU",  "iShares Gold Trust",                           "금",                "금 현물",                             4, "금 ETF AUM 2위, 저보수"),
+    ("GLDM", "SPDR Gold MiniShares",                         "금",                "금 현물",                             4, "금 최저보수, 소액투자용"),
+    ("SLV",  "iShares Silver Trust",                         "은",                "은 현물",                             3, "은 ETF AUM 1위"),
+    ("SIVR", "abrdn Physical Silver Shares ETF",             "은",                "은 현물",                             3, "은 ETF 저보수 AUM 2위"),
+    ("PDBC", "Invesco Optimum Yield Diversified Commodity",  "원자재 브로드",      "Active Broad Commodity",              4, "광범위 원자재 AUM 1위, K-1 없음"),
+    ("DJP",  "iPath Bloomberg Commodity Index ETN",          "원자재 브로드",      "Bloomberg Commodity",                 3, "블룸버그 원자재 ETN"),
+    ("COMT", "iShares GSCI Commodity Dynamic Roll ETF",      "원자재 브로드",      "S&P GSCI Dynamic Roll",               3, "GSCI 기반 롤 최적화"),
+    ("USO",  "United States Oil Fund",                       "에너지 원자재",      "WTI 원유 선물",                       3, "WTI 원유 AUM 1위 (콘탱고 주의)"),
+    ("DBE",  "Invesco DB Energy Fund",                       "에너지 원자재",      "DBIQ Optimum Yield Energy",           3, "에너지 원자재 다각화"),
+    ("UNG",  "United States Natural Gas Fund",               "에너지 원자재",      "천연가스 선물",                       3, "천연가스 AUM 1위 (콘탱고 주의)"),
+    ("DBA",  "Invesco DB Agriculture Fund",                  "농산물",             "DBIQ Diversified Agriculture",        3, "농산물 AUM 1위"),
+    ("WEAT", "Teucrium Wheat Fund",                          "농산물",             "밀 선물 3종 블렌드",                  3, "밀 순수 노출"),
+    ("CORN", "Teucrium Corn Fund",                           "농산물",             "옥수수 선물 3종 블렌드",              3, "옥수수 순수 노출"),
+    ("TIP",  "iShares TIPS Bond ETF",                        "인플레이션 헤지(TIPS)","Bloomberg US TIPS",                4, "TIPS AUM 1위"),
+    ("SCHP", "Schwab U.S. TIPS ETF",                         "인플레이션 헤지(TIPS)","Bloomberg US TIPS",                4, "TIPS 최저보수 AUM 2위"),
+    ("STIP", "iShares 0-5 Year TIPS Bond ETF",               "인플레이션 헤지(TIPS)","Bloomberg 0-5Y TIPS",              4, "단기 TIPS, 듀레이션 최소"),
+    ("TLT",  "iShares 20+ Year Treasury Bond ETF",           "채권 헤지(장기국채)","ICE US Treasury 20+ Year",           3, "장기국채 AUM 1위, 최대 유동성"),
+    ("EDV",  "Vanguard Extended Duration Treasury ETF",      "채권 헤지(장기국채)","Bloomberg US Treasury STRIPS 20-30Y",3, "초장기 STRIPS 저보수"),
+    ("ZROZ", "PIMCO 25+ Year Zero Coupon US Treasury ETF",   "채권 헤지(장기국채)","ICE BofA Long US Treasury STRIPS",   3, "제로쿠폰 장기국채, 최고 듀레이션"),
+    ("RPAR", "RPAR Risk Parity ETF",                         "멀티에셋 헤지",      "Active Risk Parity",                  3, "리스크 패리티 순수 ETF"),
+    ("AOM",  "iShares Core Moderate Allocation ETF",         "멀티에셋 헤지",      "S&P Target Risk Moderate",            4, "중립형 멀티에셋"),
+    ("AOA",  "iShares Core Aggressive Allocation ETF",       "멀티에셋 헤지",      "S&P Target Risk Aggressive",          4, "공격형 멀티에셋"),
+    ("VIXY", "ProShares VIX Short-Term Futures ETF",         "변동성(VIX)",        "S&P 500 VIX Short-Term Futures",      3, "VIX 단기선물 AUM 1위"),
+    ("UVXY", "ProShares Ultra VIX Short-Term Futures ETF",   "변동성(VIX)",        "S&P 500 VIX Short-Term 1.5x",         3, "1.5배 레버리지 VIX"),
+    ("SVXY", "ProShares Short VIX Short-Term Futures ETF",   "변동성(VIX)",        "S&P 500 VIX Short-Term -0.5x",        3, "역방향 VIX (변동성 매도)"),
+    ("BTAL", "AGFiQ U.S. Market Neutral Anti-Beta Fund",     "롱숏 전략",          "Active Long-Short Anti-Beta",         3, "마켓 뉴트럴 롱숏 대표"),
+    ("QAI",  "IQ Hedge Multi-Strategy Tracker ETF",          "롱숏 전략",          "IQ Hedge Multi-Strategy",             3, "헤지펀드 멀티전략 복제"),
+    ("HDGE", "AdvisorShares Ranger Equity Bear ETF",         "롱숏 전략",          "Active Short-Only Equity",            3, "액티브 숏 온리 ETF"),
+    ("AIEQ", "AI Powered Equity ETF",                        "퀀트/머신러닝",      "Active (IBM Watson AI)",              3, "AI 머신러닝 주식선택"),
+    ("QVAL", "Alpha Architect U.S. Quantitative Value ETF",  "퀀트/머신러닝",      "Active Deep Value Quant",             3, "퀀트 딥밸류 전략"),
+    ("QMOM", "Alpha Architect U.S. Quantitative Momentum",   "퀀트/머신러닝",      "Active Quantitative Momentum",        3, "퀀트 모멘텀 전략"),
+    ("PSP",  "Invesco Global Listed Private Equity ETF",     "사모투자(PE) 복제",  "Red Rocks Global Listed PE",          3, "글로벌 상장 PE 복제 AUM 1위"),
+    ("PEX",  "ProShares Global Listed Private Equity ETF",   "사모투자(PE) 복제",  "LPX Direct Listed PE",                3, "저보수 상장 PE 복제"),
+]
+df_alt = pd.DataFrame(alt, columns=["티커","ETF명","유형","추종지수/전략","별점(5점)","선정이유"])
+df_alt = df_alt.drop_duplicates(subset=["티커"], keep="first").reset_index(drop=True)
+
+# ── 채권형 ─────────────────────────────────────────────────
+bond = [
+    ("IGOV",  "iShares International Treasury Bond ETF",         "글로벌 국채",  "단기/중기",     "FTSE World Government Bond ex-US",              3, "미국 제외 글로벌 국채 대표"),
+    ("BWX",   "SPDR Bloomberg International Treasury Bond ETF",  "글로벌 국채",  "단기/중기",     "Bloomberg Global Treasury ex-US",               3, "블룸버그 글로벌 국채(미국제외)"),
+    ("BWZ",   "SPDR Bloomberg Short Term International Tsy",     "글로벌 국채",  "단기",          "Bloomberg Global Treasury ex-US 1-3Y",          3, "글로벌 단기 국채(미국제외)"),
+    ("BNDX",  "Vanguard Total International Bond ETF",           "글로벌 국채",  "전구간",        "Bloomberg Global Aggregate ex-USD Float Adj.",  4, "글로벌 채권 최저보수, AUM 1위"),
+    ("IAGG",  "iShares Core International Aggregate Bond ETF",   "글로벌 국채",  "전구간",        "Bloomberg Global Aggregate ex USD",             4, "글로벌 총채권 저보수 AUM 2위"),
+    ("BOND",  "PIMCO Active Bond ETF",                           "글로벌 국채",  "전구간",        "Active (Bloomberg US Aggregate 벤치마크)",       4, "PIMCO 액티브 글로벌 채권"),
+    ("SHY",   "iShares 1-3 Year Treasury Bond ETF",              "미국 국채",    "단기(1-3Y)",    "ICE US Treasury 1-3 Year",                      4, "미국 단기국채 AUM 1위"),
+    ("SCHO",  "Schwab Short-Term U.S. Treasury ETF",             "미국 국채",    "단기(1-3Y)",    "Bloomberg US Treasury 1-3 Year",                4, "미국 단기국채 최저보수"),
+    ("VGSH",  "Vanguard Short-Term Treasury ETF",                "미국 국채",    "단기(1-3Y)",    "Bloomberg US Treasury 1-3 Year",                4, "뱅가드 단기국채"),
+    ("IEI",   "iShares 3-7 Year Treasury Bond ETF",              "미국 국채",    "중기(3-7Y)",    "ICE US Treasury 3-7 Year",                      4, "미국 중기국채(3-7Y) AUM 1위"),
+    ("IEF",   "iShares 7-10 Year Treasury Bond ETF",             "미국 국채",    "중기(7-10Y)",   "ICE US Treasury 7-10 Year",                     4, "미국 7-10년 국채 AUM 1위"),
+    ("SCHR",  "Schwab Intermediate-Term U.S. Treasury ETF",      "미국 국채",    "중기(3-10Y)",   "Bloomberg US Treasury 3-10 Year",               4, "미국 중기국채 최저보수"),
+    ("VGIT",  "Vanguard Intermediate-Term Treasury ETF",         "미국 국채",    "중기(3-10Y)",   "Bloomberg US Treasury 3-10 Year",               4, "뱅가드 중기국채"),
+    ("TLT",   "iShares 20+ Year Treasury Bond ETF",              "미국 국채",    "장기(20Y+)",    "ICE US Treasury 20+ Year",                      3, "미국 장기국채 AUM 1위, 유동성 최우수"),
+    ("VGLT",  "Vanguard Long-Term Treasury ETF",                 "미국 국채",    "장기(10Y+)",    "Bloomberg US Treasury Long-Term",               3, "뱅가드 장기국채 저보수"),
+    ("SPTL",  "SPDR Portfolio Long Term Treasury ETF",           "미국 국채",    "장기(10Y+)",    "Bloomberg US Treasury Long-Term",               3, "미국 장기국채 최저보수"),
+    ("EDV",   "Vanguard Extended Duration Treasury ETF",         "미국 국채",    "초장기(25Y+)",  "Bloomberg US Treasury STRIPS 20-30Y",           3, "초장기 STRIPS, 듀레이션 최대"),
+    ("ZROZ",  "PIMCO 25+ Year Zero Coupon US Treasury ETF",      "미국 국채",    "초장기(25Y+)",  "ICE BofA Long US Treasury STRIPS",              3, "제로쿠폰 장기국채"),
+    ("BND",   "Vanguard Total Bond Market ETF",                  "미국 국채",    "전구간",        "Bloomberg US Aggregate Float Adjusted",         4, "미국 전구간 채권 AUM 1위, 최저보수"),
+    ("AGG",   "iShares Core U.S. Aggregate Bond ETF",            "미국 국채",    "전구간",        "Bloomberg US Aggregate Bond",                   4, "미국 전구간 채권 AUM 2위"),
+    ("SCHZ",  "Schwab U.S. Aggregate Bond ETF",                  "미국 국채",    "전구간",        "Bloomberg US Aggregate Bond",                   4, "미국 전구간 채권 최저보수 AUM 3위"),
+    ("IBTE",  "iShares Euro Govt Bond 1-3yr UCITS ETF",          "유럽 국채",    "단기(1-3Y)",    "Bloomberg Euro Government Bond 1-3Y",           3, "유럽 단기 국채 대표 (UCITS)"),
+    ("EXX5",  "iShares Core Euro Govt Bond UCITS ETF (1-3Y)",    "유럽 국채",    "단기(1-3Y)",    "Bloomberg Euro Government 1-3Y",                3, "유로존 단기 국채"),
+    ("IBTS",  "iShares Euro Govt Bond 3-7yr UCITS ETF",          "유럽 국채",    "중기(3-7Y)",    "Bloomberg Euro Government Bond 3-7Y",           3, "유럽 중기 국채"),
+    ("EUNH",  "iShares Core Euro Govt Bond UCITS ETF",           "유럽 국채",    "중기",          "Bloomberg Euro Government Bond",                4, "유로존 국채 대표, AUM 최대"),
+    ("IBTL",  "iShares Euro Govt Bond 15-30yr UCITS ETF",        "유럽 국채",    "장기(15-30Y)",  "Bloomberg Euro Government Bond 15-30Y",         3, "유럽 장기 국채"),
+    ("EXML",  "Lyxor EuroMTS 10-15Y Investment Grade ETF",       "유럽 국채",    "장기(10-15Y)",  "EuroMTS 10-15Y IG",                             3, "유로존 10-15년 국채"),
+    ("HEZU",  "iShares Currency Hedged MSCI EMU ETF",            "유럽 국채",    "전구간(USD헤지)","MSCI EMU (USD Hedged)",                         3, "유럽 달러헤지 참고용"),
+    ("EMAG",  "VanEck EM Aggregate Bond ETF",                    "유럽 국채",    "전구간",        "Bloomberg EM Aggregate Bond",                   3, "신흥국+유럽 혼합 집계 채권"),
+    ("HJPX",  "iShares Currency Hedged JPX-Nikkei 400 ETF",     "일본 국채",    "참고(주식+채권)","JPX-Nikkei 400 (USD Hedged)",                   3, "엔화헤지 일본 자산 참고"),
+    ("LQD",   "iShares iBoxx $ Investment Grade Corporate Bond", "기타:IG 회사채","전구간",        "Markit iBoxx USD Liquid Investment Grade",      4, "IG 회사채 AUM 1위, 유동성 최우수"),
+    ("VCIT",  "Vanguard Intermediate-Term Corporate Bond ETF",   "기타:IG 회사채","중기(5-10Y)",   "Bloomberg US Corporate 5-10 Year",              4, "IG 중기 회사채 AUM 1위, 최저보수"),
+    ("VCLT",  "Vanguard Long-Term Corporate Bond ETF",           "기타:IG 회사채","장기(10Y+)",    "Bloomberg US Corporate Long-Term",              4, "IG 장기 회사채 저보수"),
+    ("IGLB",  "iShares Long-Term Corporate Bond ETF",            "기타:IG 회사채","장기(10Y+)",    "ICE BofA 10+ Year US Corporate",               4, "IG 장기 회사채 최저보수"),
+    ("USIG",  "iShares Broad USD Investment Grade Corp Bond ETF","기타:IG 회사채","전구간",        "ICE BofA US Corporate",                         4, "IG 전구간 저보수"),
+    ("SPIB",  "SPDR Portfolio Intermediate Term Corp Bond ETF",  "기타:IG 회사채","중기",          "Bloomberg US Corporate 1-10 Year",              4, "IG 중기 최저보수 대안"),
+    ("HYG",   "iShares iBoxx $ High Yield Corporate Bond ETF",   "기타:HY 채권", "전구간",        "Markit iBoxx USD Liquid High Yield",            3, "HY 채권 AUM 1위, 유동성 최우수"),
+    ("JNK",   "SPDR Bloomberg High Yield Bond ETF",              "기타:HY 채권", "전구간",        "Bloomberg High Yield Very Liquid",              3, "HY 채권 AUM 2위"),
+    ("USHY",  "iShares Broad USD High Yield Corporate Bond ETF", "기타:HY 채권", "전구간",        "ICE BofA US High Yield Constrained",            4, "HY 채권 최저보수"),
+    ("SHYG",  "iShares 0-5 Year High Yield Corporate Bond ETF",  "기타:HY 채권", "단기(0-5Y)",    "Markit iBoxx USD Liquid High Yield 0-5",        3, "단기 HY 채권, 듀레이션 최소"),
+    ("HYDB",  "iShares U.S. High Yield Bond ETF",                "기타:HY 채권", "전구간",        "Bloomberg US High Yield Very Liquid (Factor)",  4, "팩터 선별 HY 채권"),
+    ("FALN",  "iShares Fallen Angels USD Bond ETF",              "기타:HY 채권", "전구간",        "Bloomberg US High Yield Fallen Angel 3% Capped",4, "투자등급->HY 강등채 (Fallen Angel)"),
+]
+df_bond = pd.DataFrame(bond, columns=["티커","ETF명","분류","만기구분","추종지수","별점(5점)","선정이유"])
+df_bond = df_bond.drop_duplicates(subset=["티커"], keep="first").reset_index(drop=True)
+
+# ── 주의사항 ────────────────────────────────────────────────
+notes = [
+    ("선물 기반 ETF",    "USO, UNG, VIXY, UVXY, SVXY, DJP, DBE, WEAT, CORN", "콘탱고 롤 비용으로 장기 보유 시 성과 괴리 발생. 단기/헤지 용도 권장"),
+    ("레버리지/인버스 ETF","UVXY, SVXY", "일간 리셋 구조로 장기 보유 시 변동성 끌림(Volatility Decay) 발생"),
+    ("고보수 ETF",       "PSP(1.44%), HDGE(3.10%), ROBO(0.95%)", "실질 수익률 검토 필수. 성과 대비 보수 효율 낮을 수 있음"),
+    ("데이터 기준",      "AUM, 상장연도, 운용보수 출처", "stockanalysis.com 자동 수집. CAGR: EODHD 월별 adjusted_close 기준 연환산"),
+    ("국면 모델 활용 시","상관관계 점검", "STAG/RECE 국면: 금(GLD/IAU), TIPS(TIP/SCHP), 장기국채(TLT) 상관관계 정기 점검 권장"),
+]
+df_notes = pd.DataFrame(notes, columns=["구분","대상 ETF","주의사항"])
+
+
+# ══════════════════════════════════════════════════════════════
+# 3. 전체 티커 수집 -> EODHD(CAGR) + stockanalysis(AUM·상장연도·운용보수)
+# ══════════════════════════════════════════════════════════════
+SHEETS = {
+    "인덱스형ETF": (df_idx,   "분류"),
+    "테마형ETF":   (df_theme, "테마"),
+    "대체형ETF":   (df_alt,   "유형"),
+    "채권형ETF":   (df_bond,  "분류"),
+}
+
+all_tickers = []
+for df, _ in SHEETS.values():
+    all_tickers.extend(df["티커"].tolist())
+unique_tickers = list(dict.fromkeys(all_tickers))
+total = len(unique_tickers)
+print(f"총 ETF 수: {total}개\n")
+
+# -- EODHD: CAGR -----------------------------------------
+print("=" * 60)
+print("[1/2] EODHD - CAGR 수집")
+print("=" * 60)
+cagr_map = {}
+for i, ticker in enumerate(unique_tickers, 1):
+    cagr_map[ticker] = fetch_eodhd(ticker)
+    cagr_str = f"{cagr_map[ticker]:+.1f}%" if cagr_map[ticker] is not None else "N/A"
+    print(f"  [{i:3d}/{total}] {ticker:<8} {cagr_str}")
+    time.sleep(0.12)
+
+ok1 = sum(1 for v in cagr_map.values() if v is not None)
+print(f"\n  완료: {ok1}개 성공 / {total - ok1}개 실패\n")
+
+# -- stockanalysis: AUM + 상장연도 + 운용보수 --------------
+print("=" * 60)
+print("[2/2] stockanalysis.com - AUM / 상장연도 / 운용보수 수집")
+print("=" * 60)
+aum_map     = {}
+year_map    = {}
+expense_map = {}
+for i, ticker in enumerate(unique_tickers, 1):
+    aum, year, expense = fetch_stockanalysis(ticker)
+    aum_map[ticker]     = aum
+    year_map[ticker]    = year
+    expense_map[ticker] = expense
+    aum_str  = f"{aum:.0f}억$" if aum is not None else "N/A"
+    yr_str   = str(year)       if year is not None  else "N/A"
+    exp_str  = f"{expense}%"   if expense is not None else "N/A"
+    print(f"  [{i:3d}/{total}] {ticker:<8} AUM={aum_str:<12} 상장={yr_str}  보수={exp_str}")
+    time.sleep(0.3)
+
+ok2 = sum(1 for v in aum_map.values() if v is not None)
+print(f"\n  완료: {ok2}개 성공 / {total - ok2}개 실패\n")
+
+
+# ══════════════════════════════════════════════════════════════
+# 4. DataFrames에 AUM · 상장연도 · CAGR · 운용보수 삽입
+#    추종지수 바로 뒤에 순서대로 삽입
+# ══════════════════════════════════════════════════════════════
+def enrich_df(df):
+    df = df.copy()
+    # 추종지수 컬럼 찾기 (인덱스형/테마형/대체형: '추종지수' or '추종지수/전략')
+    ref_col = next((c for c in df.columns if c.startswith("추종지수")), None)
+    insert_at = df.columns.get_loc(ref_col) + 1 if ref_col else len(df.columns)
+
+    new_cols = [
+        ("AUM(억달러)",    [aum_map.get(t)     for t in df["티커"]]),
+        ("상장연도",       [year_map.get(t)    for t in df["티커"]]),
+        ("CAGR(%,연환산)", [cagr_map.get(t)    for t in df["티커"]]),
+        ("운용보수(%)",    [expense_map.get(t) for t in df["티커"]]),
+    ]
+    for col, vals in new_cols:
+        if col in df.columns:
+            df[col] = vals
+        else:
+            df.insert(insert_at, col, vals)
+            insert_at += 1
+    return df
+
+df_idx   = enrich_df(df_idx)
+df_theme = enrich_df(df_theme)
+df_alt   = enrich_df(df_alt)
+df_bond  = enrich_df(df_bond)
+
+SHEETS = {
+    "인덱스형ETF": (df_idx,   "분류"),
+    "테마형ETF":   (df_theme, "테마"),
+    "대체형ETF":   (df_alt,   "유형"),
+    "채권형ETF":   (df_bond,  "분류"),
+}
+
+
+# ══════════════════════════════════════════════════════════════
+# 5. 엑셀 저장
+# ══════════════════════════════════════════════════════════════
+# 최종 컬럼 순서:
+#   인덱스형: 티커·ETF명·분류·추종지수·AUM·상장연도·CAGR·운용보수·별점·선정이유
+#   채권형:   티커·ETF명·분류·만기구분·추종지수·AUM·상장연도·CAGR·운용보수·별점·선정이유
+COL_WIDTHS = {
+    "인덱스형ETF": [8, 42, 14, 28, 10, 8, 10, 8, 6, 35],
+    "테마형ETF":   [8, 42, 16, 30, 10, 8, 10, 8, 6, 35],
+    "대체형ETF":   [8, 42, 18, 30, 10, 8, 10, 8, 6, 35],
+    "채권형ETF":   [8, 42, 16, 14, 36, 10, 8, 10, 8, 6, 35],
+}
+
+with pd.ExcelWriter(OUTPUT, engine="xlsxwriter") as writer:
+    wb = writer.book
+
+    header_fmt = wb.add_format({
+        "bold": True, "bg_color": "#1a1a2e", "font_color": "white",
+        "border": 1, "align": "center", "valign": "vcenter",
+        "font_size": 11, "font_name": "맑은 고딕"
+    })
+    cell_fmt = wb.add_format({
+        "border": 1, "align": "left", "valign": "vcenter",
+        "font_size": 10, "font_name": "맑은 고딕", "text_wrap": True
+    })
+
+    def write_sheet(df, sheet_name, cat_col, col_widths):
+        df.to_excel(writer, sheet_name=sheet_name, index=False,
+                    header=False, startrow=1)
+        ws = writer.sheets[sheet_name]
+
+        for col_num, col_name in enumerate(df.columns):
+            ws.write(0, col_num, col_name, header_fmt)
+
+        for col_idx, width in enumerate(col_widths[:len(df.columns)]):
+            ws.set_column(col_idx, col_idx, width)
+
+        prev_cat = None
+        row_colors = ["#ffffff", "#f4f6f8"]
+        for row_idx, (_, row) in enumerate(df.iterrows()):
+            cur_cat = row[cat_col]
+            bg = "#e8f4fd" if cur_cat != prev_cat else row_colors[row_idx % 2]
+            prev_cat = cur_cat
+
+            base_fmt = wb.add_format({
+                "border": 1, "align": "left", "valign": "vcenter",
+                "font_size": 10, "font_name": "맑은 고딕",
+                "text_wrap": True, "bg_color": bg
+            })
+            rnum_fmt = wb.add_format({
+                "border": 1, "align": "right", "valign": "vcenter",
+                "font_size": 10, "font_name": "맑은 고딕", "bg_color": bg
+            })
+            rpct_fmt = wb.add_format({
+                "border": 1, "align": "right", "valign": "vcenter",
+                "font_size": 10, "font_name": "맑은 고딕",
+                "num_format": "0.00%", "bg_color": bg
+            })
+            rpos_fmt = wb.add_format({
+                "border": 1, "align": "right", "valign": "vcenter",
+                "font_size": 10, "font_name": "맑은 고딕",
+                "font_color": "#1a7a3a", "bold": True, "bg_color": bg
+            })
+            rneg_fmt = wb.add_format({
+                "border": 1, "align": "right", "valign": "vcenter",
+                "font_size": 10, "font_name": "맑은 고딕",
+                "font_color": "#c0392b", "bold": True, "bg_color": bg
+            })
+            rna_fmt = wb.add_format({
+                "border": 1, "align": "center", "valign": "vcenter",
+                "font_size": 10, "font_name": "맑은 고딕",
+                "font_color": "#aaaaaa", "bg_color": bg
+            })
+
+            ws.set_row(row_idx + 1, 18)
+            for col_idx, (col_name, val) in enumerate(zip(df.columns, row)):
+                if col_name == "AUM(억달러)":
+                    if val is None or (isinstance(val, float) and np.isnan(val)):
+                        ws.write(row_idx + 1, col_idx, "N/A", rna_fmt)
+                    else:
+                        ws.write(row_idx + 1, col_idx, val, rnum_fmt)
+                elif col_name == "상장연도":
+                    if val is None or (isinstance(val, float) and np.isnan(val)):
+                        ws.write(row_idx + 1, col_idx, "N/A", rna_fmt)
+                    else:
+                        ws.write(row_idx + 1, col_idx, int(val), rnum_fmt)
+                elif col_name == "별점(5점)":
+                    ws.write(row_idx + 1, col_idx, val, rnum_fmt)
+                elif col_name == "운용보수(%)":
+                    if val is None or (isinstance(val, float) and np.isnan(val)):
+                        ws.write(row_idx + 1, col_idx, "N/A", rna_fmt)
+                    else:
+                        ws.write(row_idx + 1, col_idx, val / 100, rpct_fmt)
+                elif col_name == "CAGR(%,연환산)":
+                    if val is None or (isinstance(val, float) and np.isnan(val)):
+                        ws.write(row_idx + 1, col_idx, "N/A", rna_fmt)
+                    elif val >= 0:
+                        ws.write(row_idx + 1, col_idx, f"+{val:.2f}%", rpos_fmt)
+                    else:
+                        ws.write(row_idx + 1, col_idx, f"{val:.2f}%", rneg_fmt)
+                else:
+                    ws.write(row_idx + 1, col_idx, val, base_fmt)
+
+        ws.freeze_panes(1, 0)
+        ws.autofilter(0, 0, len(df), len(df.columns) - 1)
+
+    write_sheet(df_idx,   "인덱스형ETF", "분류", COL_WIDTHS["인덱스형ETF"])
+    write_sheet(df_theme, "테마형ETF",   "테마", COL_WIDTHS["테마형ETF"])
+    write_sheet(df_alt,   "대체형ETF",   "유형", COL_WIDTHS["대체형ETF"])
+    write_sheet(df_bond,  "채권형ETF",   "분류", COL_WIDTHS["채권형ETF"])
+
+    df_notes.to_excel(writer, sheet_name="주의사항", index=False,
+                      header=False, startrow=1)
+    ws_n = writer.sheets["주의사항"]
+    for col_num, col_name in enumerate(df_notes.columns):
+        ws_n.write(0, col_num, col_name, header_fmt)
+    ws_n.set_column(0, 0, 20)
+    ws_n.set_column(1, 1, 40)
+    ws_n.set_column(2, 2, 60)
+    for row_idx, (_, row) in enumerate(df_notes.iterrows()):
+        ws_n.set_row(row_idx + 1, 30)
+        for col_idx, val in enumerate(row):
+            ws_n.write(row_idx + 1, col_idx, val, cell_fmt)
+
+print(f"\n저장 완료: {OUTPUT}")
+print(f"  인덱스형: {len(df_idx)}개 | 테마형: {len(df_theme)}개 | 대체형: {len(df_alt)}개 | 채권형: {len(df_bond)}개")
