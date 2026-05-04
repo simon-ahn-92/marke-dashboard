@@ -1,0 +1,410 @@
+# -*- coding: utf-8 -*-
+"""
+통합_대시보드.py
+─────────────────────────────────────────────────────────
+세 개의 시각화 파이프라인을 순차 실행 후, 단일 HTML 대시보드로 통합
+
+  탭 1: 📊 시장 분석           ← 시각화_03_v3.py
+  탭 2: 💼 모델 포트폴리오     ← 포트폴리오_MP.py
+  탭 3: 📈 보조 분석           ← 시각화_05_포트폴리오.py
+
+사용법:
+  python 통합_대시보드.py             # 세 스크립트 모두 실행 + 통합
+  python 통합_대시보드.py --wrap-only # 스크립트 실행 생략, 통합 HTML만 재생성
+"""
+
+import sys, io, os
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+import subprocess
+import argparse
+import html as html_module
+from pathlib import Path
+from datetime import datetime
+
+# ═══════════════════════════════════════════════════════
+# 설정
+# ═══════════════════════════════════════════════════════
+BASE_DIR              = Path(r"C:\python\성일\국면판단 모델")
+OUTPUT_PATH           = BASE_DIR / "국면판단_통합대시보드.html"
+OUTPUT_STANDALONE     = BASE_DIR / "국면판단_통합대시보드_단일파일.html"
+
+# 각 탭 정의 — 화면 표시 순서
+TABS = [
+    {
+        "id":      "tab-market",
+        "label":   "📊 시장 분석",
+        "sublabel":"DTW · 위기 국면 · 히트맵",
+        "script":  "시각화_03_v3.py",
+        "html":    "국면판단_시각화_03_v3.html",
+    },
+    {
+        "id":      "tab-supplement",
+        "label":   "📈 보조 분석",
+        "sublabel":"Excel 기반 포트폴리오 보조 시각화",
+        "script":  "시각화_05_포트폴리오.py",
+        "html":    "국면판단_시각화_05_포트폴리오.html",
+    },
+    {
+        "id":      "tab-portfolio",
+        "label":   "💼 모델 포트폴리오",
+        "sublabel":"자산배분 · 백테스트 · 개선안",
+        "script":  "포트폴리오_MP.py",
+        "html":    "국면판단_포트폴리오_MP.html",
+    },
+]
+
+
+# ═══════════════════════════════════════════════════════
+# 하위 스크립트 실행
+# ═══════════════════════════════════════════════════════
+def run_subscript(script_name: str) -> bool:
+    """스크립트 1개를 자식 프로세스로 실행. 출력은 그대로 콘솔에 흘려보냄."""
+    script_path = BASE_DIR / script_name
+    if not script_path.exists():
+        print(f"  [경고] {script_name} 파일 없음 — 건너뜀")
+        return False
+
+    print(f"\n{'='*72}")
+    print(f"▶ {script_name} 실행")
+    print('='*72)
+
+    # Windows 환경에서 UTF-8 출력 보장
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"]       = "1"
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            cwd=str(BASE_DIR),
+            env=env,
+            check=False,
+        )
+        ok = (result.returncode == 0)
+        if not ok:
+            print(f"  [경고] 종료 코드 {result.returncode}")
+        return ok
+    except Exception as e:
+        print(f"  [오류] 실행 실패: {e}")
+        return False
+
+
+# ═══════════════════════════════════════════════════════
+# 통합 HTML 빌더
+# ═══════════════════════════════════════════════════════
+def build_wrapper_html(standalone: bool = False) -> str:
+    """탭 + iframe 기반 래퍼 HTML 생성
+
+    standalone=False: iframe src에 상대경로 (4개 파일 묶음 배포)
+    standalone=True : iframe srcdoc에 HTML 인라인 임베드 (1개 파일 배포)
+    """
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # 탭 버튼
+    tab_buttons = []
+    for i, tab in enumerate(TABS):
+        active = "active" if i == 0 else ""
+        # 결과 HTML 존재 여부 표시
+        html_path = BASE_DIR / tab["html"]
+        status_dot = "●" if html_path.exists() else "○"
+        status_color = "#2ecc71" if html_path.exists() else "#e74c3c"
+        tab_buttons.append(
+            f'<button class="tab-btn {active}" '
+            f'onclick="showTab(\'{tab["id"]}\', this)">'
+            f'<span class="tab-status" style="color:{status_color};">{status_dot}</span> '
+            f'<span class="tab-label">{tab["label"]}</span>'
+            f'<span class="tab-sub">{tab["sublabel"]}</span>'
+            f'</button>'
+        )
+
+    # 탭 콘텐츠 (iframe)
+    tab_contents = []
+    for i, tab in enumerate(TABS):
+        active = "active" if i == 0 else ""
+        html_path = BASE_DIR / tab["html"]
+        if html_path.exists():
+            if standalone:
+                # 단일 파일 모드: HTML 내용을 srcdoc에 인라인 임베드
+                inner_html = html_path.read_text(encoding="utf-8")
+                escaped    = html_module.escape(inner_html, quote=True)
+                content = (
+                    f'<iframe srcdoc="{escaped}" frameborder="0"></iframe>'
+                )
+            else:
+                # 일반 모드: 상대경로 src
+                content = (
+                    f'<iframe src="{tab["html"]}" '
+                    f'frameborder="0" loading="{"eager" if i == 0 else "lazy"}"></iframe>'
+                )
+        else:
+            content = (
+                f'<div class="missing">'
+                f'  <h2>⚠ HTML 미생성</h2>'
+                f'  <p><b>{tab["html"]}</b> 파일이 없습니다.</p>'
+                f'  <p>해결: <code>python {tab["script"]}</code> 실행 후 이 페이지 새로고침</p>'
+                f'</div>'
+            )
+        tab_contents.append(
+            f'<div id="{tab["id"]}" class="tab-content {active}">{content}</div>'
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>국면판단 통합 대시보드</title>
+<style>
+/* ── 기초 파일들과 동일한 색상·폰트 체계 (시각화_03_v3 / 시각화_05 / 포트폴리오_MP) ── */
+* {{ box-sizing: border-box; }}
+html, body {{
+    margin: 0; padding: 0;
+    background: #111111;                                          /* 기초 파일과 동일 */
+    font-family: 'Malgun Gothic', Arial, sans-serif;              /* 기초 파일과 동일 */
+    color: rgba(255,255,255,0.87);                                /* 기초 파일과 동일 */
+    height: 100vh; overflow: hidden;
+}}
+.app-header {{
+    background: #1a1a2e;                                          /* 기초 파일과 동일 */
+    padding: 16px 28px;
+    border-bottom: 2px solid #2c3e50;                             /* 기초 파일과 동일 */
+    display: flex; align-items: center; justify-content: space-between;
+    flex-wrap: wrap; gap: 12px;
+}}
+.app-title {{
+    display: flex; align-items: baseline; gap: 14px;
+}}
+.app-title h1 {{
+    margin: 0; font-size: 19px; color: white;                     /* 기초 헤더 19px와 통일 */
+}}
+.app-title .subtitle {{
+    font-size: 12px; color: rgba(255,255,255,0.45);               /* 기초 subtitle와 동일 */
+}}
+.app-meta {{
+    font-size: 11px; color: rgba(255,255,255,0.4);
+    display: flex; gap: 14px; align-items: center;
+}}
+.app-meta button {{
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.2);
+    color: rgba(255,255,255,0.85);
+    padding: 5px 12px; border-radius: 5px;
+    font-size: 11px; cursor: pointer;
+    font-family: 'Malgun Gothic', Arial, sans-serif;
+    transition: background 0.15s;
+}}
+.app-meta button:hover {{ background: rgba(255,255,255,0.14); color: white; }}
+
+.tab-bar {{
+    display: flex; gap: 4px;                                      /* 기초 4px gap과 동일 */
+    background: #1a1a2e;                                          /* 기초 파일과 동일 */
+    padding: 8px 20px 0;                                          /* 기초 파일과 동일 */
+    border-bottom: 2px solid #2c3e50;                             /* 기초 파일과 동일 */
+}}
+.tab-btn {{
+    flex: 1; min-width: 0;
+    padding: 9px 14px;                                            /* 기초 패딩에 맞춤 */
+    cursor: pointer; border: none;
+    border-radius: 6px 6px 0 0;
+    background: rgba(255,255,255,0.07);                           /* 기초와 동일 */
+    color: rgba(255,255,255,0.65);                                /* 기초와 동일 */
+    font-family: 'Malgun Gothic', Arial, sans-serif;
+    transition: background 0.2s;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    display: flex; flex-direction: column; gap: 2px;
+    text-align: left;
+}}
+.tab-btn:hover {{
+    background: rgba(255,255,255,0.14);                           /* 기초와 동일 */
+    color: white;
+}}
+.tab-btn.active {{
+    background: #111111;                                          /* 기초와 동일 (#111) */
+    color: white; font-weight: bold;
+    border-bottom: 2px solid #111111;                             /* 기초 패턴과 동일 */
+    margin-bottom: -2px;
+}}
+.tab-btn .tab-status {{ font-size: 10px; margin-right: 4px; }}
+.tab-btn .tab-label {{
+    font-size: clamp(11px, 1.3vw, 15px);                          /* 기초 반응형 사이즈와 동일 */
+    font-weight: bold; display: inline;
+}}
+.tab-btn .tab-sub {{
+    font-size: 11px; color: rgba(255,255,255,0.4);
+    display: block; margin-top: 2px;
+}}
+.tab-btn.active .tab-sub {{ color: rgba(255,255,255,0.55); }}
+
+.tab-content {{
+    display: none;
+    width: 100%;
+    height: calc(100vh - 73px - 70px);                            /* 헤더 73px + 탭바 70px (기초 파일 패턴) */
+    background: #111111;                                          /* 기초와 동일 */
+}}
+.tab-content.active {{ display: block; }}
+.tab-content iframe {{
+    width: 100%; height: 100%;
+    border: none; background: #111111;                            /* 기초와 동일 */
+}}
+.missing {{
+    padding: 80px 40px; text-align: center;
+    color: rgba(255,255,255,0.5);
+}}
+.missing h2 {{ color: #e74c3c; margin-bottom: 16px; }}
+.missing code {{
+    background: rgba(255,255,255,0.08);
+    padding: 4px 10px; border-radius: 4px;
+    font-family: 'Consolas', monospace;
+    color: #f1c40f;
+}}
+</style>
+</head>
+<body>
+
+<div class="app-header">
+    <div class="app-title">
+        <h1>📊 국면판단 통합 대시보드</h1>
+        <span class="subtitle">시장 분석 · 모델 포트폴리오 · 보조 분석</span>
+    </div>
+    <div class="app-meta">
+        <span>마지막 업데이트: {now_str}</span>
+        <button onclick="refreshActiveTab()" title="현재 탭 새로고침">🔄 새로고침</button>
+        <button onclick="openInNewWindow()" title="현재 탭을 새 창으로 열기">↗ 새 창</button>
+    </div>
+</div>
+
+<div class="tab-bar">
+{chr(10).join(tab_buttons)}
+</div>
+
+{chr(10).join(tab_contents)}
+
+<script>
+function showTab(id, btn) {{
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+    document.getElementById(id).classList.add('active');
+    btn.classList.add('active');
+
+    // Lazy iframe: 처음 활성화될 때 src 적용
+    const iframe = document.getElementById(id).querySelector('iframe');
+    if (iframe && iframe.dataset.lazy === '1' && !iframe.src) {{
+        iframe.src = iframe.dataset.src;
+    }}
+}}
+
+function refreshActiveTab() {{
+    const active = document.querySelector('.tab-content.active');
+    if (!active) return;
+    const iframe = active.querySelector('iframe');
+    if (iframe) iframe.contentWindow.location.reload();
+}}
+
+function openInNewWindow() {{
+    const active = document.querySelector('.tab-content.active');
+    if (!active) return;
+    const iframe = active.querySelector('iframe');
+    if (iframe && iframe.src) window.open(iframe.src, '_blank');
+}}
+
+// 키보드 단축키: 1/2/3 = 탭 전환
+document.addEventListener('keydown', (e) => {{
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const idx = parseInt(e.key) - 1;
+    const btns = document.querySelectorAll('.tab-btn');
+    if (idx >= 0 && idx < btns.length) {{
+        btns[idx].click();
+    }}
+}});
+</script>
+
+</body>
+</html>"""
+
+
+# ═══════════════════════════════════════════════════════
+# 메인
+# ═══════════════════════════════════════════════════════
+def main():
+    parser = argparse.ArgumentParser(description="국면판단 통합 대시보드")
+    parser.add_argument(
+        "--wrap-only", action="store_true",
+        help="하위 스크립트 실행을 건너뛰고 래퍼 HTML만 재생성"
+    )
+    parser.add_argument(
+        "--skip", nargs="*", default=[],
+        help="실행에서 제외할 스크립트 파일명 (예: --skip 시각화_05_포트폴리오.py)"
+    )
+    parser.add_argument(
+        "--standalone", action="store_true",
+        help="모든 HTML을 인라인 임베드한 단일 파일 추가 생성 (~30MB, 다른 PC 배포용)"
+    )
+    args = parser.parse_args()
+
+    print("="*72)
+    print(" 📊 국면판단 통합 대시보드 빌더")
+    print("="*72)
+    print(f" 작업 폴더: {BASE_DIR}")
+    print(f" 출력 파일: {OUTPUT_PATH}")
+    print()
+
+    # 1. 하위 스크립트 실행
+    if args.wrap_only:
+        print(" --wrap-only 옵션: 하위 스크립트 실행 생략, 래퍼만 생성\n")
+    else:
+        success_count = 0
+        for tab in TABS:
+            if tab["script"] in args.skip:
+                print(f"\n  [건너뜀] {tab['script']}")
+                continue
+            if run_subscript(tab["script"]):
+                success_count += 1
+        print(f"\n {'─'*72}")
+        print(f"  하위 스크립트 실행 완료: {success_count}/{len(TABS) - len(args.skip)} 성공")
+
+    # 2. 결과 HTML 존재 확인
+    print(f"\n{'='*72}")
+    print(" 생성 결과 HTML 확인")
+    print('='*72)
+    all_exist = True
+    for tab in TABS:
+        path = BASE_DIR / tab["html"]
+        if path.exists():
+            size_kb = path.stat().st_size // 1024
+            print(f"  ✓ {tab['html']:50s}  {size_kb:>6,} KB")
+        else:
+            print(f"  ✗ {tab['html']:50s}  (없음)")
+            all_exist = False
+
+    if not all_exist:
+        print("\n  [경고] 일부 HTML이 없습니다. 해당 탭은 안내 메시지만 표시됩니다.")
+
+    # 3. 래퍼 HTML 생성
+    print(f"\n{'='*72}")
+    print(" 통합 래퍼 HTML 생성")
+    print('='*72)
+    html = build_wrapper_html(standalone=False)
+    OUTPUT_PATH.write_text(html, encoding="utf-8")
+    size_kb = OUTPUT_PATH.stat().st_size // 1024
+    print(f"  ✓ {OUTPUT_PATH.name}  ({size_kb:,} KB)  — 4개 파일 묶음 배포용")
+
+    # 3-2. (옵션) 단일 파일 standalone 버전
+    if args.standalone:
+        print(f"\n  단일 파일 모드: HTML 인라인 임베드 중...")
+        html_solo = build_wrapper_html(standalone=True)
+        OUTPUT_STANDALONE.write_text(html_solo, encoding="utf-8")
+        size_mb = OUTPUT_STANDALONE.stat().st_size / 1024 / 1024
+        print(f"  ✓ {OUTPUT_STANDALONE.name}  ({size_mb:.1f} MB)  — 단일 파일 배포용")
+
+    print(f"\n {'─'*72}")
+    print(f" [완료] 브라우저로 열기: {OUTPUT_PATH}")
+    if args.standalone:
+        print(f"          단일 파일 버전:   {OUTPUT_STANDALONE}")
+    print(f" {'─'*72}")
+    print("\n 단축키 안내: 1/2/3 키로 탭 전환, 새로고침/새창 버튼 우상단\n")
+
+
+if __name__ == "__main__":
+    main()
