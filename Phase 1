@@ -1,0 +1,895 @@
+# -*- coding: utf-8 -*-
+"""
+ETF 체크리스트 평가
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+입력: ETF_목록.xlsx (168개 ETF 큐레이션)
+출력: ETF_체크리스트.xlsx (12개 항목 평가 + 6개 이상 통과 ETF만 필터)
+
+12개 체크리스트 항목:
+  자동 검증 (9개):
+    1. 트랙레코드 5년 이상 (10년 선호)
+    2. AUM USD 100M 이상
+    3. Morningstar 등 독립평가 양호 (별점 >= 4 proxy)
+    4. 5년 벤치마크 상회 (vs SPY/AGG)
+    5. Sharpe/Sortino/MDD 데이터 확보 가능
+    6. 일별 유동성 + 투명 수수료 (보수 < 0.75%)
+    7. 한국 법인 세무 적합 (US/UCITS)
+   11. 레버리지/투기/구조화노트 코어 사용 ❌
+   12. 명확한 분배정책 + 인컴 이력
+
+  사용자 컨텍스트 필요 (3개) → ? 표시:
+    8. 패밀리 기존보유 ISIN과 차별화
+    9. 단일 펀드 비중 20% 미만
+   10. HY/커버드콜 15% 미만
+"""
+import sys, io, ssl, urllib3, time
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+ssl._create_default_https_context = ssl._create_unverified_context
+urllib3.disable_warnings()
+
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INPUT_PATH  = r"C:\python\성일\국면판단 모델\ETF_목록.xlsx"
+OUTPUT_PATH = r"C:\python\성일\국면판단 모델\패밀리오피스 손님 자산배분안\ETF_체크리스트.xlsx"
+EODHD_KEY   = "69db6513a3c116.22375919"
+TODAY       = datetime.today()
+CURRENT_YR  = TODAY.year
+
+# 자동 검증 항목 9개 / 컨텍스트 항목 3개
+AUTO_ITEMS = [1, 2, 3, 4, 5, 6, 7, 11, 12]
+CTX_ITEMS  = [8, 9, 10]
+PASS_THRESHOLD = 6   # 자동 검증 9개 중 6개 이상 ✓이면 통과
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 0. 뮤추얼 펀드 큐레이션
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 컬럼: 티커, 펀드명, 분류, 추종지수/전략, AUM(억달러), 상장연도, 운용보수(%), 별점, 선정이유
+# AUM 출처: 펀드사 공시 (2024~2025 기준 추정), 운용보수: 정관 기준
+MUTUAL_FUNDS = [
+    # ── Vanguard 인덱스 펀드 ──────────────────────
+    ("VFIAX", "Vanguard 500 Index Fund Admiral",         "인덱스(주식)", "S&P 500",                   8500.0, 2000, 0.04, 5, "S&P500 인덱스 대표, 최저보수 Admiral"),
+    ("VTSAX", "Vanguard Total Stock Market Admiral",     "인덱스(주식)", "CRSP US Total Market",      18000.0, 2000, 0.04, 5, "전체시장 AUM 1위 뮤추얼펀드"),
+    ("VTIAX", "Vanguard Total International Stock Adm",  "인덱스(주식)", "FTSE Global All Cap ex US", 7800.0, 2010, 0.10, 4, "글로벌 미국제외 인덱스 대표"),
+    ("VEXAX", "Vanguard Extended Market Index Admiral",  "인덱스(주식)", "S&P Completion",             950.0, 2001, 0.06, 4, "중소형주 인덱스 (S&P500 보완)"),
+    ("VBIIX", "Vanguard Intermediate-Term Bond Index",   "인덱스(채권)", "Bloomberg US Aggregate 5-10Y", 380.0, 1994, 0.07, 4, "중기채 인덱스, 저보수"),
+
+    # ── Fidelity 인덱스 펀드 ─────────────────────
+    ("FXAIX", "Fidelity 500 Index Fund",                 "인덱스(주식)", "S&P 500",                   6300.0, 2011, 0.015, 5, "S&P500 최저보수 (0.015%)"),
+    ("FSKAX", "Fidelity Total Market Index Fund",        "인덱스(주식)", "Dow Jones US Total Market", 1100.0, 2011, 0.015, 5, "전체시장 최저보수"),
+    ("FXNAX", "Fidelity US Bond Index Fund",             "인덱스(채권)", "Bloomberg US Aggregate",     650.0, 2011, 0.025, 4, "미국 종합채권 인덱스 저보수"),
+
+    # ── Vanguard 액티브/밸런스 ──────────────────
+    ("VWELX", "Vanguard Wellington (Investor)",          "밸런스",        "60/40 액티브 (1929~)",      1100.0, 1929, 0.25, 5, "최장수 밸런스 펀드 (95년 운용)"),
+    ("VWENX", "Vanguard Wellington Admiral",             "밸런스",        "60/40 액티브",              1100.0, 2001, 0.16, 5, "Wellington Admiral 클래스"),
+    ("VWINX", "Vanguard Wellesley Income (Investor)",    "인컴",          "40/60 액티브",               560.0, 1970, 0.23, 5, "보수형 인컴 펀드 (40주식/60채권)"),
+    ("VWIAX", "Vanguard Wellesley Income Admiral",       "인컴",          "40/60 액티브",               560.0, 2001, 0.16, 5, "Wellesley Admiral 클래스"),
+
+    # ── Fidelity 액티브 ──────────────────────────
+    ("FCNTX", "Fidelity Contrafund",                     "액티브 성장",   "Active Large Growth",       1500.0, 1967, 0.39, 5, "장기 성장주 액티브 대표"),
+    ("FBGRX", "Fidelity Blue Chip Growth Fund",          "액티브 성장",   "Active Large Growth",        650.0, 1987, 0.46, 4, "블루칩 성장주 액티브"),
+    ("FBALX", "Fidelity Balanced Fund",                  "밸런스",        "Active 60/40",               350.0, 1986, 0.50, 4, "Fidelity 밸런스 액티브"),
+    ("FMAGX", "Fidelity Magellan",                       "액티브 성장",   "Active Large Growth",        300.0, 1963, 0.43, 3, "역사적 액티브 펀드 (피터 린치)"),
+
+    # ── Dodge & Cox ──────────────────────────────
+    ("DODGX", "Dodge & Cox Stock Fund",                  "액티브 가치",   "Active Large Value",         900.0, 1965, 0.51, 5, "가치주 액티브 대표"),
+    ("DODBX", "Dodge & Cox Balanced Fund",               "밸런스",        "Active 60/40",               170.0, 1931, 0.51, 4, "최장수 밸런스 (94년)"),
+    ("DODIX", "Dodge & Cox Income Fund",                 "액티브 채권",   "Active Bond",                700.0, 1989, 0.41, 4, "액티브 인컴 채권"),
+
+    # ── American Funds ──────────────────────────
+    ("AGTHX", "American Funds Growth Fund of America A", "액티브 성장",   "Active Large Growth",       3000.0, 1973, 0.62, 4, "Growth Fund of America"),
+    ("AWSHX", "American Funds Washington Mutual A",      "액티브 가치",   "Active Large Value",        1700.0, 1952, 0.57, 4, "보수형 가치주 (장기배당)"),
+    ("ANWPX", "American Funds New Perspective A",        "액티브 글로벌", "Active Global Growth",      1450.0, 1973, 0.74, 4, "글로벌 성장주 액티브"),
+
+    # ── PIMCO 채권 ───────────────────────────────
+    ("PTTRX", "PIMCO Total Return Institutional",        "액티브 채권",   "Active Aggregate",          780.0, 1987, 0.46, 4, "총수익 채권 액티브 대표"),
+    ("PIMIX", "PIMCO Income Fund Institutional",         "인컴 채권",     "Active Multi-Sector Bond",  1300.0, 2007, 0.51, 5, "인컴 채권 AUM 1위"),
+
+    # ── T. Rowe Price ───────────────────────────
+    ("PRGFX", "T. Rowe Price Growth Stock",              "액티브 성장",   "Active Large Growth",        540.0, 1950, 0.66, 4, "성장주 액티브"),
+    ("PRWCX", "T. Rowe Price Capital Appreciation",      "밸런스",        "Active Tactical 60/40",      560.0, 1986, 0.71, 5, "택티컬 밸런스 (Giroux)"),
+
+    # ── 채권 액티브 (기타 명문) ─────────────────
+    ("MWTRX", "Metropolitan West Total Return Bond M",   "액티브 채권",   "Active Aggregate",           770.0, 1997, 0.67, 4, "Aggregate 채권 액티브"),
+    ("BAGIX", "Baird Aggregate Bond Institutional",      "액티브 채권",   "Active Aggregate",           120.0, 2000, 0.30, 4, "저보수 채권 액티브"),
+
+    # ── Parnassus / 섹터 액티브 ─────────────────
+    ("PRBLX", "Parnassus Core Equity Fund Investor",     "ESG 주식",      "Active ESG Large Cap",       260.0, 1992, 0.83, 4, "ESG 주식 액티브"),
+]
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 0-2-A. Quality / 배당성장 ETF 큐레이션 (Direction 매칭용 추가)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUALITY_DIVGROWTH_ETFS = [
+    # ── 퀄리티 (Quality Factor) ───────────────
+    ("SPHQ", "Invesco S&P 500 Quality ETF",                  "퀄리티",       "S&P 500 Quality",                 100.0, 2005, 0.15, 4, "S&P500 퀄리티 대표"),
+    ("QUAL", "iShares MSCI USA Quality Factor ETF",          "퀄리티",       "MSCI USA Quality Factor",         500.0, 2013, 0.15, 5, "MSCI 퀄리티 AUM 1위"),
+    # ── 배당 (High Dividend) ──────────────────
+    ("DVY",  "iShares Select Dividend ETF",                  "고배당",       "Dow Jones US Select Dividend",    220.0, 2003, 0.38, 4, "고배당 ETF 대표 (2003~)"),
+    ("VYM",  "Vanguard High Dividend Yield ETF",             "고배당",       "FTSE High Dividend Yield",        650.0, 2006, 0.06, 5, "고배당 AUM 1위, 최저보수"),
+    ("HDV",  "iShares Core High Dividend ETF",               "고배당",       "Morningstar Dividend Yield Focus", 110.0, 2011, 0.08, 4, "고배당 ETF 저보수"),
+    # ── 배당성장 (Dividend Growth) ────────────
+    ("VIG",  "Vanguard Dividend Appreciation ETF",           "배당성장",     "S&P US Dividend Growers",         990.0, 2006, 0.06, 5, "배당성장 AUM 1위, 최저보수"),
+    ("SCHD", "Schwab US Dividend Equity ETF",                "배당성장",     "Dow Jones US Dividend 100",       690.0, 2011, 0.06, 5, "배당성장 AUM 2위 (인기 1위)"),
+    ("DGRO", "iShares Core Dividend Growth ETF",             "배당성장",     "Morningstar US Dividend Growth",  300.0, 2014, 0.08, 4, "배당성장 저보수"),
+    ("SCHY", "Schwab International Dividend Equity ETF",     "배당성장",     "Dow Jones Intl Dividend 100",      18.0, 2021, 0.14, 4, "글로벌 배당성장 (Direction 명시)"),
+    ("NOBL", "ProShares S&P 500 Dividend Aristocrats ETF",   "배당성장",     "S&P 500 Dividend Aristocrats",    115.0, 2013, 0.35, 4, "배당귀족 (25년+ 배당성장)"),
+    # ── 현금/MMF (Direction Y1 10% 슬롯) ────
+    ("SHV",  "iShares Short Treasury Bond ETF",              "현금성",        "ICE 1-3개월 T-Bill",              215.0, 2007, 0.15, 5, "초단기 국채 (현금성)"),
+    ("BIL",  "SPDR Bloomberg 1-3 Month T-Bill ETF",          "현금성",        "Bloomberg 1-3 Month T-Bill",      400.0, 2007, 0.135, 5, "1-3개월 T-Bill (MMF 대체)"),
+    ("SGOV", "iShares 0-3 Month Treasury Bond ETF",          "현금성",        "ICE 0-3 Month T-Bill",            450.0, 2020, 0.09, 5, "0-3개월 국채, 최저보수"),
+]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 0-2-B. Preferred / 커버드콜 ETF 큐레이션 (Direction 매칭용 추가)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PREFERRED_CC_ETFS = [
+    # ── Preferred Securities (우선주/하이브리드) ───────────────
+    ("PFF",  "iShares Preferred and Income Securities ETF",  "우선주",     "ICE Exchange-Listed Preferred",          150.0, 2007, 0.46, 4, "우선주 ETF AUM 1위"),
+    ("PGX",  "Invesco Preferred ETF",                        "우선주",     "ICE BofA Core Plus Fixed Rate Pref",      35.0, 2008, 0.50, 3, "우선주 AUM 2위"),
+    ("PFFD", "Global X U.S. Preferred ETF",                  "우선주",     "ICE BofA Diversified Core US Pref",       28.0, 2017, 0.23, 4, "우선주 저보수"),
+    ("PFFA", "Virtus InfraCap U.S. Preferred Stock ETF",     "우선주",     "Active Preferred",                          7.0, 2018, 1.36, 3, "액티브 우선주 (보수 높음)"),
+    ("PFXF", "VanEck Preferred Securities ex Financials ETF","우선주",     "ICE Exchange-Listed Pref ex-Financial",   22.0, 2012, 0.40, 4, "금융제외 우선주"),
+
+    # ── 커버드콜 / 옵션수익 ETF ────────────────────
+    ("JEPI", "JPMorgan Equity Premium Income ETF",            "커버드콜",   "Active S&P 500 Covered Call ELN",         400.0, 2020, 0.35, 5, "커버드콜 AUM 1위, 액티브"),
+    ("JEPQ", "JPMorgan Nasdaq Equity Premium Income ETF",     "커버드콜",   "Active Nasdaq-100 Covered Call ELN",      280.0, 2022, 0.35, 5, "Nasdaq 커버드콜 대표"),
+    ("DIVO", "Amplify CWP Enhanced Dividend Income ETF",      "커버드콜",   "Active 배당+선택적 옵션",                   34.0, 2016, 0.55, 4, "선택적 커버드콜 (배당 우위)"),
+    ("SPYI", "NEOS S&P 500 High Income ETF",                  "커버드콜",   "Active S&P 500 + Index Options",           38.0, 2022, 0.68, 4, "택스 효율 옵션 인컴"),
+    ("QYLD", "Global X NASDAQ 100 Covered Call ETF",          "커버드콜",   "CBOE NASDAQ-100 BuyWrite",                 95.0, 2013, 0.61, 3, "Nasdaq 커버드콜 (수동)"),
+]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 1. EODHD CAGR 계산 (5년)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def fetch_5y_cagr(ticker: str) -> float | None:
+    """최근 5년 CAGR(%) — EODHD adjusted_close 월별"""
+    suffix = ".US"
+    if "." in ticker:
+        sym = ticker
+    else:
+        sym = ticker + suffix
+
+    url = (f"https://eodhd.com/api/eod/{sym}"
+           f"?api_token={EODHD_KEY}&fmt=json&period=m")
+    try:
+        r = requests.get(url, timeout=15, verify=False)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, list) or len(data) < 24:
+            return None
+        # 최근 60개월 슬라이스
+        recent = data[-60:] if len(data) >= 60 else data
+        closes = [d.get("adjusted_close") for d in recent
+                  if d.get("adjusted_close") is not None]
+        if len(closes) < 24:
+            return None
+        years = len(closes) / 12.0
+        if closes[0] <= 0:
+            return None
+        return ((closes[-1] / closes[0]) ** (1 / years) - 1) * 100
+    except Exception:
+        return None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 1-1B. 5년 일간 가격 → Sharpe / Sortino / Vol / MDD
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def fetch_5y_risk_metrics(ticker: str, rf_annual: float = 0.04) -> dict:
+    """일간 adjusted_close → Sharpe(연환산), Sortino, Vol(연환산), MaxDrawdown
+    rf_annual: 연 무위험수익률 (기본 4%, 미국 단기 T-bill 평균)
+    반환: {"sharpe": ..., "sortino": ..., "vol_annual_pct": ..., "mdd_pct": ..., "n_days": ...}
+    """
+    sym = ticker if "." in ticker else ticker + ".US"
+    today = datetime.today()
+    start = today.replace(year=today.year - 5).strftime("%Y-%m-%d")
+
+    url = (f"https://eodhd.com/api/eod/{sym}"
+           f"?api_token={EODHD_KEY}&fmt=json&from={start}&period=d")
+    try:
+        r = requests.get(url, timeout=20, verify=False)
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        if not isinstance(data, list) or len(data) < 252:
+            return {}
+
+        closes = [d.get("adjusted_close") for d in data
+                  if d.get("adjusted_close") is not None and d["adjusted_close"] > 0]
+        if len(closes) < 252:
+            return {}
+
+        prices = pd.Series(closes, dtype=float)
+        rets   = prices.pct_change().dropna()
+        if len(rets) < 100:
+            return {}
+
+        # 연환산 변동성
+        vol_d  = rets.std()
+        vol_a  = vol_d * (252 ** 0.5)
+
+        # 연환산 평균 수익률 (산술)
+        mu_d   = rets.mean()
+        mu_a   = mu_d * 252
+
+        # Sharpe = (μ - rf) / σ
+        sharpe = (mu_a - rf_annual) / vol_a if vol_a > 0 else None
+
+        # Sortino: 하방 변동성만 사용 (rf 일별 환산 대비 손실)
+        rf_d   = rf_annual / 252
+        downside = rets[rets < rf_d] - rf_d
+        if len(downside) > 0:
+            down_d = (downside ** 2).mean() ** 0.5
+            down_a = down_d * (252 ** 0.5)
+            sortino = (mu_a - rf_annual) / down_a if down_a > 0 else None
+        else:
+            sortino = None
+
+        # MDD (5년 일간 기준)
+        cummax = prices.cummax()
+        dd     = (prices / cummax - 1.0)
+        mdd    = float(dd.min()) * 100   # %로 표시
+
+        return {
+            "sharpe":         round(sharpe, 2) if sharpe is not None else None,
+            "sortino":        round(sortino, 2) if sortino is not None else None,
+            "vol_annual_pct": round(float(vol_a) * 100, 2),
+            "mdd_pct":        round(mdd, 2),
+            "n_days":         len(rets),
+        }
+    except Exception:
+        return {}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 1-2. TTM 인컴 수익률 계산
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def fetch_ttm_yield(ticker: str) -> tuple:
+    """최근 12개월 분배 / 현재가 → TTM 수익률(%)
+
+    자본이득 분배 제거 이중 필터:
+      A) NAV의 3% 초과 단일 분배 → 자본이득으로 간주 (액티브 뮤추얼펀드 대응)
+      B) 잔여 분배의 중앙값 × 3 초과 → 추가 outlier 제거 (분기 + 연말 보너스 대응)
+
+    반환: (ttm_yield_pct, ttm_sum, outlier_excluded_count, current_price, last_div_date)
+    """
+    if "." in ticker:
+        sym = ticker
+    else:
+        sym = ticker + ".US"
+
+    today = datetime.today()
+    one_year_ago = today.replace(year=today.year - 1).strftime("%Y-%m-%d")
+
+    div_url = (f"https://eodhd.com/api/div/{sym}"
+               f"?api_token={EODHD_KEY}&from={one_year_ago}&fmt=json")
+    eod_url = (f"https://eodhd.com/api/eod/{sym}"
+               f"?api_token={EODHD_KEY}&from={(today.replace(month=max(today.month-2,1))).strftime('%Y-%m-%d')}"
+               f"&fmt=json")
+
+    try:
+        divs   = requests.get(div_url, timeout=15, verify=False).json()
+        prices = requests.get(eod_url, timeout=15, verify=False).json()
+
+        if not isinstance(divs, list) or not divs:
+            return None, 0.0, 0, None, None
+        if not isinstance(prices, list) or not prices:
+            return None, 0.0, 0, None, None
+
+        last_px = prices[-1].get("adjusted_close") or prices[-1].get("close")
+        if not last_px or float(last_px) <= 0:
+            return None, 0.0, 0, None, None
+        last_px = float(last_px)
+
+        values = [float(d.get("value", 0)) for d in divs
+                  if d.get("value") and float(d.get("value", 0)) > 0]
+        if not values:
+            return None, 0.0, 0, last_px, None
+
+        excluded = 0
+
+        # A) NAV의 3% 초과 단일 분배 = 자본이득
+        # (정상 분배: 분기당 0.5~1%, 연 1회 1.5~2.5%; 자본이득은 통상 NAV의 5~15%)
+        nav_thr = last_px * 0.03
+        kept_a = []
+        for v in values:
+            if v > nav_thr:
+                excluded += 1
+            else:
+                kept_a.append(v)
+
+        # B) 잔여 분배의 중앙값 × 3 초과 → 추가 outlier
+        if len(kept_a) >= 3:
+            sv = sorted(kept_a)
+            n = len(sv)
+            med = sv[n // 2] if n % 2 else (sv[n//2-1] + sv[n//2]) / 2
+            med_thr = med * 3.0
+            kept_b = []
+            for v in kept_a:
+                if v > med_thr:
+                    excluded += 1
+                else:
+                    kept_b.append(v)
+        else:
+            kept_b = kept_a
+
+        ttm_sum = sum(kept_b)
+        ttm_yld = (ttm_sum / last_px) * 100
+        last_dt = divs[-1].get("date")
+
+        # 모든 분배가 자본이득으로 필터링됨 → 액티브 뮤추얼펀드 (배당+자본이득 일괄 분배)
+        # 데이터로 분리 불가 → -1 (sentinel)로 반환
+        if ttm_sum == 0 and excluded > 0:
+            return -1.0, 0.0, excluded, last_px, last_dt
+
+        return round(ttm_yld, 2), round(ttm_sum, 4), excluded, last_px, last_dt
+
+    except Exception:
+        return None, 0.0, 0, None, None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 2. 벤치마크 5년 CAGR 사전 계산
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def get_benchmark_cagrs() -> dict:
+    """SPY (주식), AGG (채권) 5년 CAGR"""
+    print("\n[벤치마크 5년 CAGR]")
+    bm = {}
+    for tk in ["SPY", "AGG"]:
+        c = fetch_5y_cagr(tk)
+        bm[tk] = c
+        print(f"  {tk}: {c:+.2f}%" if c is not None else f"  {tk}: N/A")
+    return bm
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 3. 12개 체크리스트 평가
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LEVERAGE_KEYWORDS = ["Leveraged", "Ultra", "Inverse", "Short", "2x", "3x",
+                     "-1x", "-2x", "-3x", "Bear", "Bull"]
+HY_KEYWORDS = ["High Yield", "HY ", "Junk", "Covered Call", "BuyWrite"]
+INCOME_CATEGORIES = ["채권", "회사채", "국채", "TIPS", "리츠", "부동산",
+                     "고배당", "배당", "Dividend", "HY", "IG"]
+
+def evaluate_etf(row: pd.Series, sheet: str, cagr_5y: float | None,
+                 bm_cagrs: dict, fund_type: str = "etf") -> dict:
+    """단일 ETF/뮤추얼펀드 12개 항목 평가 → {1: '✓', 2: '✗', ...}
+    fund_type: "etf" | "mutual"  (#7 한국 세무 처리 차이)
+    """
+    ticker  = str(row.get("티커", "")).strip()
+    name    = str(row.get("ETF명", "") or "")
+    aum     = row.get("AUM(억달러)")  # 억달러 단위
+    year    = row.get("상장연도")
+    expense = row.get("운용보수(%)")  # ratio (0.0003 = 0.03%)
+    star    = row.get("별점(5점)")
+    category = ""
+    for col in ["분류", "테마", "유형"]:
+        if col in row.index and pd.notna(row.get(col)):
+            category = str(row[col])
+            break
+    if "만기구분" in row.index and pd.notna(row.get("만기구분")):
+        category += " " + str(row["만기구분"])
+
+    text = (name + " " + category).lower()
+    chk = {}
+
+    # 1. 트랙레코드 5년 이상 (10년 선호)
+    if pd.notna(year):
+        age = CURRENT_YR - int(year)
+        if age >= 10:
+            chk[1] = "✓⭐"   # 10년 이상
+        elif age >= 5:
+            chk[1] = "✓"
+        else:
+            chk[1] = "✗"
+    else:
+        chk[1] = "?"
+
+    # 2. AUM USD 100M 이상 (1억달러 = AUM 1.0)
+    if pd.notna(aum):
+        chk[2] = "✓" if float(aum) >= 1.0 else "✗"
+    else:
+        chk[2] = "?"
+
+    # 3. 독립평가 양호 (별점 >= 4 proxy)
+    if pd.notna(star):
+        chk[3] = "✓" if int(star) >= 4 else "△"   # 3점은 보통, 4점 이상만 ✓
+    else:
+        chk[3] = "?"
+
+    # 4. 5년 벤치마크 상회 (Equity → SPY, Bond → AGG)
+    is_bond = any(k in category for k in ["채권", "국채", "회사채", "TIPS"])
+    bm_key  = "AGG" if is_bond else "SPY"
+    bm_cagr = bm_cagrs.get(bm_key)
+    if cagr_5y is not None and bm_cagr is not None:
+        chk[4] = "✓" if cagr_5y >= bm_cagr else "✗"
+    else:
+        chk[4] = "?"
+
+    # 5. Sharpe/Sortino/MDD 데이터 확보 가능 (5년 트랙레코드 = 가능)
+    chk[5] = "✓" if chk[1].startswith("✓") else "✗"
+
+    # 6. 일별 유동성 + 투명 수수료
+    # US 상장 ETF는 일별 거래 ✓, 운용보수 < 0.75%이면 투명/저보수 ✓
+    # 입력 단위: ETF는 ratio(0.0003=0.03%), 뮤추얼은 percent(0.04=0.04%)
+    if pd.notna(expense):
+        exp_pct = float(expense) * 100 if fund_type == "etf" else float(expense)
+        chk[6] = "✓" if exp_pct < 0.75 else "✗"
+    else:
+        chk[6] = "?"
+
+    # 7. 한국 법인 세무 적합
+    if fund_type == "mutual":
+        # 미국 뮤추얼 펀드: 국내 거주자 직접 매수 불가 (NAV 매매, 거래소 미상장)
+        # 국내 운용사의 재간접 펀드 형태로만 접근 가능 → 사용자 확인 필요
+        chk[7] = "?"
+    else:
+        # US 상장 ETF: 양도세 22% / UCITS도 적합 → ✓
+        chk[7] = "✓"
+
+    # 8. 패밀리 기존보유 ISIN 차별화 (사용자 컨텍스트)
+    chk[8] = "?"
+
+    # 9. 단일 펀드 비중 20% 미만 (포트폴리오 컨텍스트)
+    chk[9] = "?"
+
+    # 10. HY/커버드콜 15% 미만
+    is_hy_or_cc = any(k.lower() in text for k in HY_KEYWORDS) or "HY" in category
+    if is_hy_or_cc:
+        chk[10] = "?"   # HY → 사용자 컨텍스트 필요
+    else:
+        chk[10] = "✓N/A"   # 해당없음 → 자동 OK
+
+    # 11. 레버리지/투기/구조화노트 ❌
+    has_leverage = any(k.lower() in text for k in LEVERAGE_KEYWORDS)
+    # VIX 단기/구조화 ETF는 별도 ✗
+    if ticker in ("UVXY", "SVXY", "VIXY", "USO", "UNG"):
+        chk[11] = "✗"
+    elif has_leverage:
+        chk[11] = "✗"
+    else:
+        chk[11] = "✓"
+
+    # 12. 명확한 분배정책 + 인컴 이력 (인컴 펀드인 경우만)
+    is_income = any(k.lower() in text for k in [c.lower() for c in INCOME_CATEGORIES])
+    if is_income:
+        # 인컴 펀드: 트랙레코드 5년+이면 분배 이력 확보 가능 → ✓
+        chk[12] = "✓" if chk[1].startswith("✓") else "?"
+    else:
+        chk[12] = "✓N/A"   # 인컴 펀드 아니면 N/A → 자동 OK
+
+    chk["_is_income"] = is_income
+    return chk
+
+
+def count_pass(chk: dict) -> int:
+    """자동 검증 9개 항목 중 ✓ 개수 (✓⭐, ✓N/A 포함, △/✗/? 제외)"""
+    return sum(1 for k in AUTO_ITEMS if str(chk.get(k, "")).startswith("✓"))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 4. 메인 파이프라인
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def main():
+    print("=" * 60)
+    print("  ETF 체크리스트 평가  (입력: ETF_목록.xlsx)")
+    print("=" * 60)
+
+    # 입력 시트 4개 로드
+    sheets = ["인덱스형ETF", "테마형ETF", "대체형ETF", "채권형ETF"]
+    dfs = {s: pd.read_excel(INPUT_PATH, sheet_name=s) for s in sheets}
+    total = sum(len(df) for df in dfs.values())
+    print(f"  입력: {total}개 ETF ({', '.join(f'{s}={len(d)}' for s,d in dfs.items())})")
+
+    # 벤치마크 CAGR
+    bm_cagrs = get_benchmark_cagrs()
+
+    # 뮤추얼 펀드 DataFrame 생성
+    df_mf = pd.DataFrame(MUTUAL_FUNDS, columns=[
+        "티커","ETF명","분류","추종지수","AUM(억달러)","상장연도",
+        "운용보수(%)","별점(5점)","선정이유"
+    ])
+    print(f"  뮤추얼펀드 큐레이션: {len(df_mf)}개")
+
+    # Quality/배당성장 ETF DataFrame
+    qdg_rows = []
+    for tk, nm, cat, idx_, aum, yr, exp_pct, star, why in QUALITY_DIVGROWTH_ETFS:
+        qdg_rows.append((tk, nm, cat, idx_, aum, yr, exp_pct/100, star, why))
+    df_qdg = pd.DataFrame(qdg_rows, columns=[
+        "티커","ETF명","분류","추종지수","AUM(억달러)","상장연도",
+        "운용보수(%)","별점(5점)","선정이유"
+    ])
+    print(f"  Quality/배당성장 ETF 추가: {len(df_qdg)}개")
+
+    # Preferred/커버드콜 ETF DataFrame (보수는 ETF 단위로 변환: percent → ratio)
+    pcc_rows = []
+    for tk, nm, cat, idx_, aum, yr, exp_pct, star, why in PREFERRED_CC_ETFS:
+        pcc_rows.append((tk, nm, cat, idx_, aum, yr, exp_pct/100, star, why))
+    df_pcc = pd.DataFrame(pcc_rows, columns=[
+        "티커","ETF명","분류","추종지수","AUM(억달러)","상장연도",
+        "운용보수(%)","별점(5점)","선정이유"
+    ])
+    print(f"  Preferred/커버드콜 ETF 추가: {len(df_pcc)}개")
+
+    # 모든 티커 5년 CAGR 수집 (ETF + Quality + Preferred/CC + 뮤추얼펀드)
+    print(f"\n[CAGR 수집] ETF {total}개 + Quality {len(df_qdg)}개 + "
+          f"Preferred/CC {len(df_pcc)}개 + 뮤추얼펀드 {len(df_mf)}개...")
+    all_tickers = []
+    for df in dfs.values():
+        all_tickers.extend(df["티커"].tolist())
+    all_tickers.extend(df_qdg["티커"].tolist())
+    all_tickers.extend(df_pcc["티커"].tolist())
+    all_tickers.extend(df_mf["티커"].tolist())
+    all_tickers = list(dict.fromkeys(all_tickers))
+    cagr_map = {}
+    for i, tk in enumerate(all_tickers, 1):
+        c = fetch_5y_cagr(tk)
+        cagr_map[tk] = c
+        cstr = f"{c:+5.1f}%" if c is not None else "  N/A"
+        print(f"  [{i:3d}/{len(all_tickers)}] {tk:<8} {cstr}")
+        time.sleep(0.10)
+
+    # TTM 인컴 수익률 수집 (이상치 필터링 적용)
+    print(f"\n[TTM 인컴 수익률] {len(all_tickers)}개...")
+    yield_map = {}
+    for i, tk in enumerate(all_tickers, 1):
+        y, ttm_sum, excluded, last_px, last_dt = fetch_ttm_yield(tk)
+        yield_map[tk] = {
+            "yield":    y,
+            "ttm_sum":  ttm_sum,
+            "excluded": excluded,
+            "price":    last_px,
+            "last_dt":  last_dt,
+        }
+        if y is not None:
+            ex_str = f"  (자본이득 {excluded}회 제외)" if excluded else ""
+            print(f"  [{i:3d}/{len(all_tickers)}] {tk:<8} TTM={y:5.2f}%{ex_str}")
+        else:
+            print(f"  [{i:3d}/{len(all_tickers)}] {tk:<8} 분배 없음")
+        time.sleep(0.05)
+
+    # 5년 리스크 메트릭 수집 (Sharpe / Sortino / Vol / MDD)
+    print(f"\n[5년 리스크 메트릭] Sharpe / Sortino / Vol / MDD ({len(all_tickers)}개)...")
+    risk_map = {}
+    for i, tk in enumerate(all_tickers, 1):
+        m = fetch_5y_risk_metrics(tk)
+        risk_map[tk] = m
+        if m:
+            print(f"  [{i:3d}/{len(all_tickers)}] {tk:<8} "
+                  f"Sharpe={m['sharpe']:5.2f}  Sortino={m['sortino']:5.2f}  "
+                  f"Vol={m['vol_annual_pct']:5.1f}%  MDD={m['mdd_pct']:6.1f}%")
+        else:
+            print(f"  [{i:3d}/{len(all_tickers)}] {tk:<8} 데이터 부족")
+        time.sleep(0.10)
+
+    # 각 시트별 평가 (ETF + 뮤추얼펀드)
+    print(f"\n[체크리스트 평가]")
+    result_dfs = {}
+
+    eval_targets = [(s, df, "etf") for s, df in dfs.items()]
+    eval_targets.append(("Quality_배당성장", df_qdg, "etf"))
+    eval_targets.append(("Preferred_커버드콜", df_pcc, "etf"))
+    eval_targets.append(("뮤추얼펀드", df_mf, "mutual"))
+
+    for sheet, df, ftype in eval_targets:
+        rows_eval = []
+        for _, row in df.iterrows():
+            tk = str(row["티커"])
+            cagr = cagr_map.get(tk)
+            chk  = evaluate_etf(row, sheet, cagr, bm_cagrs, fund_type=ftype)
+            passed = count_pass(chk)
+            yld_info = yield_map.get(tk, {})
+            ttm_y = yld_info.get("yield")
+            is_income = chk.get("_is_income", False)
+            risk = risk_map.get(tk, {})
+
+            rec = {
+                "티커": tk,
+                "ETF명": row.get("ETF명"),
+                "분류": row.get("분류") or row.get("테마") or row.get("유형"),
+                "5년CAGR(%)": round(cagr, 2) if cagr is not None else None,
+                "TTM수익률(%)": ttm_y,
+                "인컴구분":     "인컴" if is_income else "-",
+                "자본이득제외(회)": yld_info.get("excluded", 0),
+                "Sharpe(5y)":     risk.get("sharpe"),
+                "Sortino(5y)":    risk.get("sortino"),
+                "변동성(연%,5y)":  risk.get("vol_annual_pct"),
+                "MDD(5y,%)":      risk.get("mdd_pct"),
+                "Morningstar(수동)": "",
+                "5년 벤치마크 상회": chk.get(4),
+                "통과(9개중)": passed,
+                "1.트랙레코드5y+": chk.get(1),
+                "2.AUM 100M+": chk.get(2),
+                "3.독립평가양호": chk.get(3),
+                "4.벤치마크상회": chk.get(4),
+                "5.샤프/소티노/MDD가능": chk.get(5),
+                "6.유동성+투명수수료": chk.get(6),
+                "7.한국세무적합": chk.get(7),
+                "8.ISIN차별화": chk.get(8),
+                "9.단일펀드<20%": chk.get(9),
+                "10.HY/커버드콜<15%": chk.get(10),
+                "11.레버리지/구조화제외": chk.get(11),
+                "12.분배정책명확": chk.get(12),
+                "AUM(억달러)":  row.get("AUM(억달러)"),
+                "상장연도":     row.get("상장연도"),
+                "운용보수(%)":  row.get("운용보수(%)"),
+                "별점(5점)":    row.get("별점(5점)"),
+                "선정이유":     row.get("선정이유"),
+            }
+            rows_eval.append(rec)
+
+        result_dfs[sheet] = pd.DataFrame(rows_eval)
+        n_pass = (result_dfs[sheet]["통과(9개중)"] >= PASS_THRESHOLD).sum()
+        print(f"  {sheet:12s}  {len(df):3d}개 → 통과 {n_pass}개")
+
+    # ETF 시트만 통과 합본 (뮤추얼펀드는 별도 — #7이 ?라서 점수 비교 부정확)
+    passed_combined = []
+    for sheet, df_ev in result_dfs.items():
+        if sheet == "뮤추얼펀드":
+            continue
+        df_pass = df_ev[df_ev["통과(9개중)"] >= PASS_THRESHOLD].copy()
+        df_pass.insert(0, "구분", sheet.replace("ETF",""))
+        passed_combined.append(df_pass)
+    df_passed = pd.concat(passed_combined, ignore_index=True)
+    df_passed = df_passed.sort_values(["구분", "통과(9개중)", "AUM(억달러)"],
+                                       ascending=[True, False, False])
+    print(f"\n  ★ 통과 ETF (≥{PASS_THRESHOLD}/9): {len(df_passed)}개")
+
+    # 엑셀 저장
+    print(f"\n[엑셀 저장] {OUTPUT_PATH}")
+    save_excel(result_dfs, df_passed, bm_cagrs)
+    print("\n[완료]")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 5. 엑셀 저장 (포맷팅 포함)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def save_excel(result_dfs: dict, df_passed: pd.DataFrame, bm_cagrs: dict):
+    with pd.ExcelWriter(OUTPUT_PATH, engine="xlsxwriter") as writer:
+        wb = writer.book
+
+        # 포맷 정의
+        header_fmt = wb.add_format({
+            "bold": True, "bg_color": "#1a1a2e", "font_color": "white",
+            "border": 1, "align": "center", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕", "text_wrap": True
+        })
+        cell_fmt = wb.add_format({
+            "border": 1, "align": "center", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕"
+        })
+        cell_left = wb.add_format({
+            "border": 1, "align": "left", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕"
+        })
+        chk_ok    = wb.add_format({"border":1,"align":"center","valign":"vcenter",
+                                    "font_size":10,"bg_color":"#d5f5e3","font_color":"#1a7a3a","bold":True})
+        chk_no    = wb.add_format({"border":1,"align":"center","valign":"vcenter",
+                                    "font_size":10,"bg_color":"#fadbd8","font_color":"#c0392b","bold":True})
+        chk_q     = wb.add_format({"border":1,"align":"center","valign":"vcenter",
+                                    "font_size":10,"bg_color":"#fef5e7","font_color":"#d68910"})
+        chk_mid   = wb.add_format({"border":1,"align":"center","valign":"vcenter",
+                                    "font_size":10,"bg_color":"#ebf5fb","font_color":"#2874a6"})
+        pass_yes  = wb.add_format({"border":1,"align":"center","valign":"vcenter",
+                                    "font_size":11,"bg_color":"#1a7a3a","font_color":"white","bold":True})
+        pass_no   = wb.add_format({"border":1,"align":"center","valign":"vcenter",
+                                    "font_size":11,"bg_color":"#999999","font_color":"white"})
+
+        chk_cols = ["1.트랙레코드5y+","2.AUM 100M+","3.독립평가양호","4.벤치마크상회",
+                    "5.샤프/소티노/MDD가능","6.유동성+투명수수료","7.한국세무적합",
+                    "8.ISIN차별화","9.단일펀드<20%","10.HY/커버드콜<15%",
+                    "11.레버리지/구조화제외","12.분배정책명확"]
+
+        def write_df(df, sheet_name, is_mutual=False):
+            df.to_excel(writer, sheet_name=sheet_name, index=False,
+                        header=False, startrow=1)
+            ws = writer.sheets[sheet_name]
+            for ci, col in enumerate(df.columns):
+                ws.write(0, ci, col, header_fmt)
+
+            # 컬럼폭
+            widths = []
+            for col in df.columns:
+                if col == "티커": widths.append(8)
+                elif col == "ETF명": widths.append(38)
+                elif col == "분류" or col == "구분": widths.append(14)
+                elif col == "선정이유": widths.append(28)
+                elif col in ("통과(9개중)", "별점(5점)", "인컴구분"): widths.append(8)
+                elif col == "자본이득제외(회)": widths.append(10)
+                elif col == "TTM수익률(%)": widths.append(12)
+                elif col in ("Sharpe(5y)", "Sortino(5y)"): widths.append(10)
+                elif col in ("변동성(연%,5y)", "MDD(5y,%)"): widths.append(12)
+                elif col == "Morningstar(수동)": widths.append(13)
+                elif col in ("AUM(억달러)", "상장연도", "운용보수(%)", "5년CAGR(%)",
+                              "5년 벤치마크 상회"): widths.append(11)
+                elif col in chk_cols: widths.append(12)
+                else: widths.append(11)
+            for ci, w in enumerate(widths):
+                ws.set_column(ci, ci, w)
+
+            for ri, (_, row) in enumerate(df.iterrows()):
+                ws.set_row(ri + 1, 22)
+                for ci, col in enumerate(df.columns):
+                    val = row[col]
+                    if col == "통과(9개중)":
+                        fmt = pass_yes if (pd.notna(val) and int(val) >= PASS_THRESHOLD) else pass_no
+                        ws.write(ri+1, ci, f"{val}/9" if pd.notna(val) else "", fmt)
+                    elif col in chk_cols:
+                        s = str(val) if pd.notna(val) else ""
+                        if s.startswith("✓⭐"):
+                            ws.write(ri+1, ci, s, chk_ok)
+                        elif s.startswith("✓"):
+                            ws.write(ri+1, ci, s, chk_ok)
+                        elif s == "✗":
+                            ws.write(ri+1, ci, s, chk_no)
+                        elif s == "△":
+                            ws.write(ri+1, ci, s, chk_mid)
+                        elif s == "?":
+                            ws.write(ri+1, ci, s, chk_q)
+                        else:
+                            ws.write(ri+1, ci, s, cell_fmt)
+                    elif col in ("ETF명", "선정이유"):
+                        ws.write(ri+1, ci, val if pd.notna(val) else "", cell_left)
+                    elif col == "운용보수(%)":
+                        if pd.notna(val):
+                            # ETF는 ratio(0.0003), 뮤추얼은 percent(0.04)
+                            pct = float(val) if is_mutual else float(val) * 100
+                            ws.write(ri+1, ci, f"{pct:.2f}%", cell_fmt)
+                        else:
+                            ws.write(ri+1, ci, "", cell_fmt)
+                    elif col == "5년CAGR(%)":
+                        if pd.notna(val):
+                            ws.write(ri+1, ci, f"{float(val):+.2f}%", cell_fmt)
+                        else:
+                            ws.write(ri+1, ci, "N/A", cell_fmt)
+                    elif col == "TTM수익률(%)":
+                        if pd.notna(val) and float(val) > 0:
+                            yld = float(val)
+                            yld_fmt = chk_ok if yld >= 4.0 else cell_fmt
+                            ws.write(ri+1, ci, f"{yld:.2f}%", yld_fmt)
+                        elif pd.notna(val) and float(val) == -1:
+                            # 모든 분배가 자본이득 필터에 걸림 → 분리 불가
+                            ws.write(ri+1, ci, "혼합분배", chk_q)
+                        else:
+                            ws.write(ri+1, ci, "-", cell_fmt)
+                    elif col == "인컴구분":
+                        if val == "인컴":
+                            ws.write(ri+1, ci, val, chk_mid)
+                        else:
+                            ws.write(ri+1, ci, "-" if not pd.notna(val) or val == "-" else val, cell_fmt)
+                    elif col == "자본이득제외(회)":
+                        if pd.notna(val) and int(val) > 0:
+                            ws.write(ri+1, ci, int(val), chk_q)
+                        else:
+                            ws.write(ri+1, ci, "" if not pd.notna(val) or int(val) == 0 else int(val), cell_fmt)
+                    elif col == "Sharpe(5y)":
+                        if pd.notna(val):
+                            v = float(val)
+                            sharpe_fmt = chk_ok if v >= 1.0 else (chk_no if v < 0 else cell_fmt)
+                            ws.write(ri+1, ci, f"{v:.2f}", sharpe_fmt)
+                        else:
+                            ws.write(ri+1, ci, "N/A", cell_fmt)
+                    elif col == "Sortino(5y)":
+                        if pd.notna(val):
+                            v = float(val)
+                            sort_fmt = chk_ok if v >= 1.5 else (chk_no if v < 0 else cell_fmt)
+                            ws.write(ri+1, ci, f"{v:.2f}", sort_fmt)
+                        else:
+                            ws.write(ri+1, ci, "N/A", cell_fmt)
+                    elif col == "변동성(연%,5y)":
+                        if pd.notna(val):
+                            v = float(val)
+                            ws.write(ri+1, ci, f"{v:.2f}%", cell_fmt)
+                        else:
+                            ws.write(ri+1, ci, "N/A", cell_fmt)
+                    elif col == "MDD(5y,%)":
+                        if pd.notna(val):
+                            v = float(val)
+                            mdd_fmt = chk_no if v <= -30.0 else (chk_q if v <= -15.0 else cell_fmt)
+                            ws.write(ri+1, ci, f"{v:+.2f}%", mdd_fmt)
+                        else:
+                            ws.write(ri+1, ci, "N/A", cell_fmt)
+                    elif col == "Morningstar(수동)":
+                        ws.write(ri+1, ci, val if pd.notna(val) and val != "" else "", cell_fmt)
+                    elif col == "AUM(억달러)":
+                        if pd.notna(val):
+                            ws.write(ri+1, ci, float(val), cell_fmt)
+                        else:
+                            ws.write(ri+1, ci, "", cell_fmt)
+                    elif col == "상장연도":
+                        if pd.notna(val):
+                            ws.write(ri+1, ci, int(val), cell_fmt)
+                        else:
+                            ws.write(ri+1, ci, "", cell_fmt)
+                    else:
+                        ws.write(ri+1, ci, val if pd.notna(val) else "", cell_fmt)
+
+            ws.freeze_panes(1, 2)
+            ws.autofilter(0, 0, len(df), len(df.columns) - 1)
+
+        # 통과 ETF 시트 (최상단)
+        write_df(df_passed, "★통과ETF")
+
+        # 시트별 전체 평가
+        for sheet, df_ev in result_dfs.items():
+            if sheet == "뮤추얼펀드":
+                write_df(df_ev, "뮤추얼펀드_평가", is_mutual=True)
+            elif sheet == "Preferred_커버드콜":
+                write_df(df_ev, "Preferred_커버드콜_평가")
+            elif sheet == "Quality_배당성장":
+                write_df(df_ev, "Quality_배당성장_평가")
+            else:
+                write_df(df_ev, sheet.replace("ETF", "_평가"))
+
+        # 체크리스트 설명 시트
+        legend_rows = [
+            ("자동 검증", 1, "트랙레코드 5년 이상 (10년 선호)",
+             "상장연도 기준. 10년 이상은 ✓⭐ 표시"),
+            ("자동 검증", 2, "AUM USD 100M 이상",
+             "1억달러 (AUM(억달러) >= 1.0)"),
+            ("자동 검증", 3, "Morningstar 등 독립평가 양호",
+             "별점(5점) >= 4 proxy. △ = 3점 (보통)"),
+            ("자동 검증", 4, "5년 벤치마크 상회",
+             "주식 ETF→SPY, 채권 ETF→AGG의 5년 CAGR과 비교"),
+            ("자동 검증", 5, "Sharpe/Sortino/MDD 데이터 확보 가능",
+             "5년 트랙레코드 보유 시 자동 ✓"),
+            ("자동 검증", 6, "일별 유동성 + 투명한 수수료",
+             "US 상장 ETF는 일별 거래. 운용보수 < 0.75% 시 ✓"),
+            ("자동 검증", 7, "한국 법인 세무 적합",
+             "US 상장 (W-8BEN, 양도세 22%) → ✓"),
+            ("컨텍스트", 8, "패밀리 기존보유 ISIN과 차별화",
+             "사용자 보유 정보 필요 → ? (수동 마킹)"),
+            ("컨텍스트", 9, "단일 펀드 비중 20% 미만",
+             "포트폴리오 구성 단계 검토 필요 → ?"),
+            ("컨텍스트", 10, "HY/커버드콜 단일 15% 미만",
+             "HY 펀드는 ?, 그 외 ✓N/A"),
+            ("자동 검증", 11, "레버리지/투기/구조화노트 코어 사용 ❌",
+             "Leveraged/Ultra/Inverse/Bear/2x/3x/VIX 등 키워드 검사"),
+            ("자동 검증", 12, "명확한 분배정책 + 인컴 이력",
+             "채권/리츠/배당 등 인컴 펀드: 5년+ ✓, 그 외: ✓N/A"),
+        ]
+        df_legend = pd.DataFrame(legend_rows,
+            columns=["구분", "번호", "체크리스트 항목", "평가 방식"])
+        df_legend.to_excel(writer, sheet_name="체크리스트설명",
+                           index=False, header=False, startrow=1)
+        ws_l = writer.sheets["체크리스트설명"]
+        for ci, col in enumerate(df_legend.columns):
+            ws_l.write(0, ci, col, header_fmt)
+        ws_l.set_column(0, 0, 12)
+        ws_l.set_column(1, 1, 6)
+        ws_l.set_column(2, 2, 36)
+        ws_l.set_column(3, 3, 60)
+        for ri, (_, row) in enumerate(df_legend.iterrows()):
+            ws_l.set_row(ri+1, 32)
+            for ci, val in enumerate(row):
+                ws_l.write(ri+1, ci, val,
+                    cell_fmt if ci != 3 else cell_left)
+
+        # 벤치마크 정보
+        bm_rows = [("SPY (주식 벤치마크)", f"{bm_cagrs['SPY']:+.2f}%" if bm_cagrs.get('SPY') is not None else "N/A"),
+                   ("AGG (채권 벤치마크)", f"{bm_cagrs['AGG']:+.2f}%" if bm_cagrs.get('AGG') is not None else "N/A"),
+                   ("기준 통과 점수",        f"{PASS_THRESHOLD} / 9 (자동 검증 항목 9개 중)"),
+                   ("평가 일자",             TODAY.strftime("%Y-%m-%d"))]
+        df_bm = pd.DataFrame(bm_rows, columns=["구분", "값"])
+        df_bm.to_excel(writer, sheet_name="벤치마크",
+                       index=False, header=False, startrow=1)
+        ws_b = writer.sheets["벤치마크"]
+        for ci, col in enumerate(df_bm.columns):
+            ws_b.write(0, ci, col, header_fmt)
+        ws_b.set_column(0, 0, 25)
+        ws_b.set_column(1, 1, 30)
+        for ri, (_, row) in enumerate(df_bm.iterrows()):
+            ws_b.set_row(ri+1, 22)
+            for ci, val in enumerate(row):
+                ws_b.write(ri+1, ci, val, cell_fmt)
+
+
+if __name__ == "__main__":
+    main()
