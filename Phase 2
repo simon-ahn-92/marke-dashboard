@@ -1,0 +1,528 @@
+# -*- coding: utf-8 -*-
+"""
+Phase 2 — Direction 하드룰 필터링 + 카테고리별 후보 매핑
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+입력: 패밀리오피스 손님 자산배분안/ETF_체크리스트.xlsx (Phase 1 결과)
+출력: 패밀리오피스 손님 자산배분안/MaxxTech_상품후보.xlsx
+
+Direction 매핑 카테고리 (10개):
+  1. Quality / 배당성장 주식
+  2. 글로벌 코어 / 성장 균형
+  3. 보수형 밸런스 / 멀티에셋
+  4. 고품질 단기/중기 채권
+  5. 우선주 / 인컴 증권
+  6. 고수익 채권 (HY)
+  7. 주식 인컴 / 커버드콜
+  8. 금 / 위기 헤지
+  9. 인프라 / 실물자산 인컴
+ 10. 현금 / MMF
+
+하드룰:
+  - 트랙레코드 ≥ 5년
+  - AUM ≥ USD 100M
+  - 레버리지/투기/구조화노트 ❌
+  - 일별 유동성 + 투명 수수료
+  - ETF 우선 (한국 법인 세무 적합)
+  - 뮤추얼펀드는 백업 표시 (직접 매수 불가, 재간접 검토 필요)
+
+종합 스코어 = Sharpe + Sortino*0.5 - (Vol-15)/30 + (AUM>10 ? 1 : 0) + (트랙>10y ? 0.5 : 0)
+"""
+import sys, io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+INPUT_PATH  = r"C:\python\성일\국면판단 모델\패밀리오피스 손님 자산배분안\ETF_체크리스트.xlsx"
+OUTPUT_PATH = r"C:\python\성일\국면판단 모델\패밀리오피스 손님 자산배분안\MaxxTech_상품후보.xlsx"
+TODAY       = datetime.today()
+CURRENT_YR  = TODAY.year
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Direction 카테고리 정의 (10개)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIRECTION_CATEGORIES = [
+    {
+        "name": "Quality_Div_Growth",
+        "label": "1. Quality / 배당성장 주식",
+        "ticker_whitelist": ["SCHD", "VIG", "DGRO", "VYM", "QUAL", "SPHQ", "DVY"],
+        "category_includes": ["퀄리티", "배당"],
+        "instruction": "퀄리티 + 배당성장; 다른 매니저/지수 선호",
+        "weight_target": "Y1: 30% / Y2: 32.5% / Y3: 25% / 최종: 25%",
+    },
+    {
+        "name": "Global_Core_Equity",
+        "label": "2. 글로벌 코어 / 성장 균형",
+        "ticker_whitelist": ["VT", "ACWI", "URTH", "VEA", "EFA", "IDEV", "VWO", "IEMG", "EEM", "VTI", "ITOT", "VOO", "IVV"],
+        "category_includes": ["전체시장", "선진국", "신흥국", "글로벌", "S&P500"],
+        "instruction": "Y1-2 자본성장 지원; 미국/USD 과집중 회피",
+        "weight_target": "Y1-3 일부 (Quality 또는 Balanced 보완)",
+    },
+    {
+        "name": "Conservative_Balanced",
+        "label": "3. 보수형 밸런스 / 멀티에셋",
+        "ticker_whitelist": ["AOM", "AOA", "AOR", "VWELX", "VWENX", "VWINX", "VWIAX", "FBALX", "DODBX", "PRWCX", "RPAR"],
+        "category_includes": ["밸런스", "60/40", "인컴"],
+        "instruction": "장기 트랙레코드, 리스크 통제, 양호한 MDD 행동",
+        "weight_target": "Y1: 25% / Y2: 20% / Y3: 15% / 최종: 15%",
+    },
+    {
+        "name": "HQ_Short_Intermediate_FI",
+        "label": "4. 고품질 단기/중기 채권",
+        "ticker_whitelist": ["SHY", "SCHO", "VGSH", "IEI", "IEF", "SCHR", "VGIT",
+                             "BND", "AGG", "SCHZ", "BNDX", "IAGG"],
+        "category_includes": ["국채", "전구간"],
+        "instruction": "보완적 듀레이션·신용프로필; 초기 고품질·단기/중기 우선",
+        "weight_target": "Y1: 25% / Y2: 20% / Y3: 10% (단기) / 최종: 10%",
+    },
+    {
+        "name": "Preferred",
+        "label": "5. 우선주 / 인컴 증권",
+        "ticker_whitelist": ["PFF", "PFFD", "PGX", "PFXF", "PFFA"],
+        "category_includes": ["우선주"],
+        "instruction": "인컴 위성만; 금리/금융섹터 집중도 주의",
+        "weight_target": "Y2: 5% / Y3: 12.5% / 최종: 12.5%",
+    },
+    {
+        "name": "HY_Bonds",
+        "label": "6. 고수익 채권 (HY)",
+        "ticker_whitelist": ["HYG", "JNK", "USHY", "SHYG", "HYDB", "FALN"],
+        "category_includes": ["HY 채권"],
+        "instruction": "인컴 위성만; 단일 ≤15% 캡, 저품질 집중 회피",
+        "weight_target": "Y3: 12.5% / 최종: 12.5%",
+    },
+    {
+        "name": "Equity_Income_CC",
+        "label": "7. 주식 인컴 / 커버드콜",
+        "ticker_whitelist": ["JEPI", "JEPQ", "DIVO", "SPYI", "QYLD"],
+        "category_includes": ["커버드콜"],
+        "instruction": "인컴 증가; 한 가지 방법론 의존 회피; 단일 ≤15% 캡",
+        "weight_target": "Y3: 15% / 최종: 15%",
+    },
+    {
+        "name": "Gold_Hedge",
+        "label": "8. 금 / 위기 헤지",
+        "ticker_whitelist": ["GLD", "IAU", "GLDM"],
+        "category_includes": ["금"],
+        "instruction": "위기 헤지; 분배금 없음",
+        "weight_target": "Y1: 5% / Y2-3: 5-7.5% / 최종: 7.5%",
+    },
+    {
+        "name": "Infrastructure",
+        "label": "9. 인프라 / 실물자산",
+        "ticker_whitelist": ["PAVE", "IGF", "IFRA", "VNQ", "SCHH", "IYR"],
+        "category_includes": ["인프라", "리츠", "부동산"],
+        "instruction": "인플레이션·인컴 다각화",
+        "weight_target": "Y1-2: 5% / Y3: 7.5% / 최종: 7.5% (Gold와 합산)",
+    },
+    {
+        "name": "Cash_MM",
+        "label": "10. 현금 / MMF",
+        "ticker_whitelist": ["SHV", "BIL", "SGOV"],
+        "category_includes": ["현금성"],
+        "instruction": "유동성·드라이파우더",
+        "weight_target": "Y1: 10% / Y2: 5% / Y3: 2.5% / 최종: 2.5%",
+    },
+]
+
+
+def detect_categories(tk: str, name: str, category_text: str) -> list:
+    """단일 상품 → 매칭되는 Direction 카테고리 리스트 (다수 매칭 가능)"""
+    matches = []
+    text_lower = (name + " " + category_text).lower()
+
+    for cat in DIRECTION_CATEGORIES:
+        # 1순위: ticker whitelist 매칭
+        if tk in cat["ticker_whitelist"]:
+            matches.append(cat["name"])
+            continue
+        # 2순위: 카테고리 키워드 매칭
+        for kw in cat["category_includes"]:
+            if kw.lower() in text_lower:
+                matches.append(cat["name"])
+                break
+    return matches
+
+
+def passes_hard_rules(row: pd.Series) -> tuple:
+    """Direction 하드룰 통과 여부 → (passed: bool, fail_reasons: list)"""
+    fails = []
+
+    # 트랙레코드 5년+
+    yr_v = _to_float(row.get("상장연도"))
+    if yr_v is not None:
+        age = CURRENT_YR - int(yr_v)
+        if age < 5:
+            fails.append(f"트랙{age}y<5")
+    else:
+        fails.append("트랙?")
+
+    # AUM 1억달러+
+    aum_v = _to_float(row.get("AUM(억달러)"))
+    if aum_v is not None:
+        if aum_v < 1.0:
+            fails.append(f"AUM${aum_v:.1f}억<1억")
+    else:
+        fails.append("AUM?")
+
+    # 레버리지/구조화 ❌
+    chk11 = str(row.get("11.레버리지/구조화제외", ""))
+    if chk11 == "✗":
+        fails.append("레버리지/구조화")
+
+    # 보수 투명성 (체크11 통과 + 6번 ✓ 또는 △ 허용)
+    chk6 = str(row.get("6.유동성+투명수수료", ""))
+    if chk6 == "✗":
+        fails.append("보수>0.75%")
+
+    return (len(fails) == 0, fails)
+
+
+def _to_float(x) -> float | None:
+    """'17.45%' / '+12.81%' / 0.85 / N/A → float or None"""
+    if pd.isna(x):
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip().replace("%", "").replace("+", "").replace(",", "")
+    if not s or s in ("-", "N/A", "혼합분배"):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def compute_score(row: pd.Series) -> float:
+    """종합 스코어 = Sharpe + Sortino*0.5 - (Vol-15)/30 + AUM/트랙 보너스"""
+    sharpe  = _to_float(row.get("Sharpe(5y)"))
+    sortino = _to_float(row.get("Sortino(5y)"))
+    vol     = _to_float(row.get("변동성(연%,5y)"))
+    aum     = _to_float(row.get("AUM(억달러)"))
+    yr      = _to_float(row.get("상장연도"))
+    star    = _to_float(row.get("별점(5점)"))
+
+    score = 0.0
+
+    if sharpe is not None:
+        score += sharpe
+    if sortino is not None:
+        score += sortino * 0.5
+    if vol is not None:
+        # 15% 변동성 기준, 그 이상은 페널티
+        score -= max(0, vol - 15) / 30.0
+    if aum is not None and aum >= 10:
+        score += 1.0
+    if yr is not None and (CURRENT_YR - int(yr)) >= 10:
+        score += 0.5
+    if star is not None:
+        score += (int(star) - 3) * 0.2   # 별점 4 = +0.2, 5 = +0.4
+
+    return round(score, 3)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 메인
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def main():
+    print("=" * 60)
+    print("  Phase 2: Direction 필터링 + 카테고리 매핑")
+    print("=" * 60)
+
+    # 모든 평가 시트 합치기
+    sheets = ["인덱스형_평가", "테마형_평가", "대체형_평가", "채권형_평가",
+              "Quality_배당성장_평가", "Preferred_커버드콜_평가", "뮤추얼펀드_평가"]
+    all_rows = []
+    for s in sheets:
+        df = pd.read_excel(INPUT_PATH, sheet_name=s)
+        df["원시트"] = s
+        df["펀드유형"] = "뮤추얼펀드" if s == "뮤추얼펀드_평가" else "ETF"
+        all_rows.append(df)
+    df_all = pd.concat(all_rows, ignore_index=True)
+    df_all = df_all.drop_duplicates(subset=["티커"], keep="first")
+    print(f"  입력 합본: {len(df_all)}개 (ETF + 뮤추얼펀드)")
+
+    # 통과(9개중) 점수 정수화
+    df_all["_score9"] = df_all["통과(9개중)"].astype(str).str.extract(r"(\d+)").astype(int)
+
+    # 하드룰 적용
+    print("\n[Direction 하드룰 필터링]")
+    pass_flags, fail_reasons = [], []
+    for _, row in df_all.iterrows():
+        ok, fails = passes_hard_rules(row)
+        pass_flags.append(ok)
+        fail_reasons.append(", ".join(fails) if fails else "")
+    df_all["하드룰통과"] = pass_flags
+    df_all["탈락사유"]   = fail_reasons
+
+    n_pass = sum(pass_flags)
+    print(f"  통과: {n_pass}/{len(df_all)}")
+    print(f"  탈락: {len(df_all) - n_pass}개")
+
+    # 종합 스코어
+    df_all["스코어"] = [compute_score(r) for _, r in df_all.iterrows()]
+
+    # Direction 카테고리 매칭
+    print("\n[Direction 카테고리 매핑]")
+    cat_matches_per_row = []
+    for _, row in df_all.iterrows():
+        cats = detect_categories(
+            str(row["티커"]),
+            str(row.get("ETF명", "")),
+            str(row.get("분류", "")),
+        )
+        cat_matches_per_row.append(cats)
+    df_all["매칭카테고리"] = [", ".join(c) for c in cat_matches_per_row]
+
+    # 카테고리별 후보 정리
+    cat_candidates = {}
+    for cat in DIRECTION_CATEGORIES:
+        rows = []
+        for i, cats in enumerate(cat_matches_per_row):
+            if cat["name"] in cats:
+                rows.append(df_all.iloc[i])
+        if rows:
+            df_cat = pd.DataFrame(rows)
+            # 하드룰 통과 + 스코어 정렬
+            df_cat = df_cat.sort_values(
+                ["하드룰통과", "스코어"], ascending=[False, False]
+            ).reset_index(drop=True)
+            cat_candidates[cat["name"]] = df_cat
+            n_pass_cat = df_cat["하드룰통과"].sum()
+            print(f"  {cat['label']:35s}  매칭 {len(df_cat):2d}개 (통과 {n_pass_cat})")
+        else:
+            cat_candidates[cat["name"]] = pd.DataFrame()
+            print(f"  {cat['label']:35s}  매칭 0개 ⚠️")
+
+    # 미매칭 상품 (Direction과 무관) 표시
+    unmatched_idx = [i for i, cats in enumerate(cat_matches_per_row) if not cats]
+    df_unmatched = df_all.iloc[unmatched_idx].copy()
+    print(f"\n  Direction 미매칭: {len(df_unmatched)}개 (테마/섹터 등 — 제외)")
+
+    # Excel 저장
+    print(f"\n[엑셀 저장] {OUTPUT_PATH}")
+    save_excel(df_all, cat_candidates, df_unmatched)
+    print("\n[Phase 2 완료]")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Excel 저장
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def save_excel(df_all: pd.DataFrame, cat_candidates: dict, df_unmatched: pd.DataFrame):
+    OUT_COLS = ["티커", "ETF명", "분류", "펀드유형", "스코어", "하드룰통과", "탈락사유",
+                "5년CAGR(%)", "TTM수익률(%)", "Sharpe(5y)", "Sortino(5y)",
+                "변동성(연%,5y)", "MDD(5y,%)", "인컴구분",
+                "AUM(억달러)", "상장연도", "운용보수(%)", "별점(5점)",
+                "Morningstar(수동)", "통과(9개중)", "선정이유"]
+
+    with pd.ExcelWriter(OUTPUT_PATH, engine="xlsxwriter") as writer:
+        wb = writer.book
+
+        header_fmt = wb.add_format({
+            "bold": True, "bg_color": "#1a1a2e", "font_color": "white",
+            "border": 1, "align": "center", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕", "text_wrap": True,
+        })
+        cell_fmt = wb.add_format({
+            "border": 1, "align": "center", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕"
+        })
+        cell_left = wb.add_format({
+            "border": 1, "align": "left", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕"
+        })
+        pass_fmt = wb.add_format({
+            "border": 1, "align": "center", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕",
+            "bg_color": "#d5f5e3", "font_color": "#1a7a3a", "bold": True,
+        })
+        fail_fmt = wb.add_format({
+            "border": 1, "align": "center", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕",
+            "bg_color": "#fadbd8", "font_color": "#c0392b",
+        })
+        score_high = wb.add_format({
+            "border": 1, "align": "center", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕",
+            "bg_color": "#1a7a3a", "font_color": "white", "bold": True,
+        })
+        intro_fmt = wb.add_format({
+            "bold": True, "font_size": 12, "font_name": "맑은 고딕",
+            "bg_color": "#fef5e7", "border": 1, "align": "left",
+            "valign": "vcenter", "text_wrap": True,
+        })
+        meta_fmt = wb.add_format({
+            "italic": True, "font_size": 10, "font_name": "맑은 고딕",
+            "border": 1, "align": "left", "valign": "vcenter", "text_wrap": True,
+        })
+
+        def write_df(df, sheet_name, intro_text=None, meta_text=None):
+            avail_cols = [c for c in OUT_COLS if c in df.columns]
+            df_out = df[avail_cols].copy()
+
+            start_row = 0
+            ws = writer.book.add_worksheet(sheet_name)
+            writer.sheets[sheet_name] = ws
+
+            if intro_text:
+                ws.merge_range(start_row, 0, start_row, len(avail_cols)-1,
+                               intro_text, intro_fmt)
+                ws.set_row(start_row, 36)
+                start_row += 1
+            if meta_text:
+                ws.merge_range(start_row, 0, start_row, len(avail_cols)-1,
+                               meta_text, meta_fmt)
+                ws.set_row(start_row, 30)
+                start_row += 1
+            start_row += 1   # 빈 줄
+
+            # 헤더
+            for ci, col in enumerate(avail_cols):
+                ws.write(start_row, ci, col, header_fmt)
+
+            # 컬럼 폭
+            widths = []
+            for col in avail_cols:
+                if col == "티커": widths.append(8)
+                elif col == "ETF명": widths.append(38)
+                elif col == "분류": widths.append(15)
+                elif col == "펀드유형": widths.append(8)
+                elif col == "스코어": widths.append(8)
+                elif col == "하드룰통과": widths.append(9)
+                elif col == "탈락사유": widths.append(20)
+                elif col == "선정이유": widths.append(28)
+                elif col in ("AUM(억달러)", "상장연도", "운용보수(%)",
+                              "5년CAGR(%)", "TTM수익률(%)", "변동성(연%,5y)",
+                              "MDD(5y,%)"): widths.append(11)
+                elif col in ("Sharpe(5y)", "Sortino(5y)", "별점(5점)",
+                              "인컴구분", "통과(9개중)"): widths.append(9)
+                elif col == "Morningstar(수동)": widths.append(13)
+                else: widths.append(11)
+            for ci, w in enumerate(widths):
+                ws.set_column(ci, ci, w)
+
+            # 데이터 행
+            for ri, (_, row) in enumerate(df_out.iterrows()):
+                ws.set_row(start_row + 1 + ri, 22)
+                for ci, col in enumerate(avail_cols):
+                    val = row[col]
+                    if col == "하드룰통과":
+                        if val:
+                            ws.write(start_row+1+ri, ci, "통과", pass_fmt)
+                        else:
+                            ws.write(start_row+1+ri, ci, "탈락", fail_fmt)
+                    elif col == "스코어":
+                        if pd.notna(val):
+                            v = float(val)
+                            fmt = score_high if v >= 1.5 else cell_fmt
+                            ws.write(start_row+1+ri, ci, f"{v:.2f}", fmt)
+                        else:
+                            ws.write(start_row+1+ri, ci, "", cell_fmt)
+                    elif col in ("ETF명", "선정이유", "탈락사유"):
+                        ws.write(start_row+1+ri, ci,
+                                 val if pd.notna(val) else "", cell_left)
+                    elif col == "운용보수(%)":
+                        if pd.notna(val):
+                            # Phase 1 출력은 이미 "0.03%" 등 문자열로 포맷됨
+                            ws.write(start_row+1+ri, ci, str(val), cell_fmt)
+                        else:
+                            ws.write(start_row+1+ri, ci, "", cell_fmt)
+                    elif col in ("5년CAGR(%)", "TTM수익률(%)",
+                                  "변동성(연%,5y)", "MDD(5y,%)"):
+                        if pd.notna(val):
+                            try:
+                                v = float(val)
+                                ws.write(start_row+1+ri, ci, f"{v:+.2f}%" if col == "MDD(5y,%)" else f"{v:.2f}%", cell_fmt)
+                            except (ValueError, TypeError):
+                                ws.write(start_row+1+ri, ci, str(val), cell_fmt)
+                        else:
+                            ws.write(start_row+1+ri, ci, "-", cell_fmt)
+                    elif col in ("Sharpe(5y)", "Sortino(5y)"):
+                        if pd.notna(val):
+                            try:
+                                ws.write(start_row+1+ri, ci, f"{float(val):.2f}", cell_fmt)
+                            except (ValueError, TypeError):
+                                ws.write(start_row+1+ri, ci, str(val), cell_fmt)
+                        else:
+                            ws.write(start_row+1+ri, ci, "-", cell_fmt)
+                    elif col == "AUM(억달러)":
+                        if pd.notna(val):
+                            ws.write(start_row+1+ri, ci, float(val), cell_fmt)
+                        else:
+                            ws.write(start_row+1+ri, ci, "", cell_fmt)
+                    elif col == "상장연도":
+                        if pd.notna(val):
+                            ws.write(start_row+1+ri, ci, int(val), cell_fmt)
+                        else:
+                            ws.write(start_row+1+ri, ci, "", cell_fmt)
+                    else:
+                        ws.write(start_row+1+ri, ci,
+                                 val if pd.notna(val) else "", cell_fmt)
+
+            ws.freeze_panes(start_row + 1, 2)
+            ws.autofilter(start_row, 0, start_row + len(df_out),
+                          len(avail_cols) - 1)
+
+        # ── 1. 카테고리별 시트 (10개) ──────────────────
+        for cat in DIRECTION_CATEGORIES:
+            df_cat = cat_candidates.get(cat["name"], pd.DataFrame())
+            if df_cat.empty:
+                continue
+            n_pass = df_cat["하드룰통과"].sum()
+            intro = (f"【{cat['label']}】  매칭 {len(df_cat)}개 / 하드룰 통과 {n_pass}개")
+            meta  = (f"Direction 지침: {cat['instruction']}    "
+                     f"| 목표 비중: {cat['weight_target']}    "
+                     f"| 추천 후보: {', '.join(cat['ticker_whitelist'][:8])}")
+            write_df(df_cat, cat["name"][:31], intro_text=intro, meta_text=meta)
+
+        # ── 2. ★Top후보 합본 (각 카테고리 상위 5개) ────
+        top_combined = []
+        for cat in DIRECTION_CATEGORIES:
+            df_cat = cat_candidates.get(cat["name"], pd.DataFrame())
+            if df_cat.empty:
+                continue
+            top = df_cat[df_cat["하드룰통과"] == True].head(5).copy()
+            if not top.empty:
+                top.insert(0, "Direction카테고리", cat["label"])
+                top_combined.append(top)
+        if top_combined:
+            df_top = pd.concat(top_combined, ignore_index=True)
+            intro = "★ Direction 카테고리별 Top 후보 (하드룰 통과 + 스코어 상위 5개)"
+            write_df(df_top, "★Top후보", intro_text=intro)
+
+        # ── 3. 전체 합본 (하드룰 통과/탈락 모두) ────────
+        df_all_disp = df_all.sort_values(
+            ["하드룰통과", "스코어"], ascending=[False, False]
+        ).reset_index(drop=True)
+        intro = (f"전체 평가 합본: {len(df_all_disp)}개 "
+                 f"(통과 {df_all_disp['하드룰통과'].sum()}, "
+                 f"탈락 {(~df_all_disp['하드룰통과']).sum()})")
+        write_df(df_all_disp, "전체합본", intro_text=intro)
+
+        # ── 4. Direction 매핑 가이드 ──────────────────
+        guide_rows = [
+            (cat["label"], cat["weight_target"], cat["instruction"],
+             ", ".join(cat["ticker_whitelist"]))
+            for cat in DIRECTION_CATEGORIES
+        ]
+        df_guide = pd.DataFrame(guide_rows,
+            columns=["카테고리", "목표 비중", "Direction 지침", "추천 티커"])
+        df_guide.to_excel(writer, sheet_name="Direction가이드",
+                          index=False, header=False, startrow=1)
+        ws_g = writer.sheets["Direction가이드"]
+        for ci, col in enumerate(df_guide.columns):
+            ws_g.write(0, ci, col, header_fmt)
+        ws_g.set_column(0, 0, 30)
+        ws_g.set_column(1, 1, 35)
+        ws_g.set_column(2, 2, 50)
+        ws_g.set_column(3, 3, 60)
+        for ri, (_, row) in enumerate(df_guide.iterrows()):
+            ws_g.set_row(ri + 1, 40)
+            for ci, val in enumerate(row):
+                ws_g.write(ri + 1, ci, val, cell_left if ci > 0 else cell_fmt)
+
+
+if __name__ == "__main__":
+    main()
