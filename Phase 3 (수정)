@@ -1,0 +1,778 @@
+# -*- coding: utf-8 -*-
+"""
+Phase 3 — 연차별 포트폴리오 매칭 + EUR 매월 매수 계산
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+입력: 패밀리오피스 손님 자산배분안/MaxxTech_상품후보.xlsx (Phase 2 결과)
+출력: 패밀리오피스 손님 자산배분안/MaxxTech_연차별포트폴리오.xlsx
+
+작업 순서:
+  1. Phase 2 카테고리별 Top 후보에서 슬롯별 1순위 자동 선정
+  2. Direction Year 1/2/3/Final 비중 매핑
+  3. EUR 4,700/월 × 36개월 (Company) + EUR 300/월 (Personal)
+  4. EUR → USD → KRW 환산 (별도 트랙)
+  5. EODHD 현재가 → 매월 매수 수량
+  6. Direction 룰 자동 검증
+"""
+import sys, io, ssl, urllib3, time
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+ssl._create_default_https_context = ssl._create_unverified_context
+urllib3.disable_warnings()
+
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from pathlib import Path
+
+INPUT_PATH  = r"C:\python\성일\국면판단 모델\패밀리오피스 손님 자산배분안\MaxxTech_상품후보.xlsx"
+OUTPUT_PATH = r"C:\python\성일\국면판단 모델\패밀리오피스 손님 자산배분안\MaxxTech_연차별포트폴리오.xlsx"
+EODHD_KEY   = "69db6513a3c116.22375919"
+TODAY       = datetime.today()
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 0. 환율 가정 + 적립금
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FX_EUR_USD = 1.08      # 2026-05 시점 가정 (실제 사용 시 갱신 필요)
+FX_USD_KRW = 1480.0    # 2026-05 시점 가정
+
+EUR_PER_MONTH_COMPANY  = 4700.0   # 거버넌스 슬리브
+EUR_PER_MONTH_PERSONAL = 300.0    # 개인 은퇴 슬리브
+N_MONTHS               = 36       # 적립 기간
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 1. 연차별 슬롯 정의 (Direction Section 5·6·9 기반)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# slot_id, 카테고리, 비중(%), 구분(메모), [선정조건]
+# 카테고리에 #2 등 suffix → 같은 카테고리에서 2번째 ETF 선정 (분산)
+
+COMPANY_SLOTS = {
+    "Y1 — Balanced Foundation (Months 1-12)": [
+        ("Quality_Div_Growth",      30.0, "퀄리티 + 배당성장 코어"),
+        ("Conservative_Balanced",   25.0, "자본보존 + 적정 성장"),
+        ("HQ_Short_Intermediate_FI",25.0, "안정 + 이자수익"),
+        ("Cash_MM",                 10.0, "유동성 + 드라이파우더"),
+        ("Gold_Hedge",               5.0, "위기 헤지"),
+        ("Infrastructure",           5.0, "인플레 + 인컴 다각화"),
+    ],
+    "Y2 — Controlled Growth + Income Prep (Months 13-24)": [
+        ("Quality_Div_Growth",      32.5, "퀄리티 코어 (성장 유지)"),
+        ("Conservative_Balanced",   20.0, "리스크 통제"),
+        ("Quality_Div_Growth#2",    12.5, "배당 인컴 (다른 ETF)"),
+        ("HQ_Short_Intermediate_FI",20.0, "안정 + 이자"),
+        ("Preferred",                5.0, "고배당 위성"),
+        ("Cash_MM",                  5.0, "유동성"),
+        ("Gold_Hedge",               5.0, "위기/인플레 헤지"),
+    ],
+    "Y3 — Transition to Income (Months 25-36)": [
+        ("Quality_Div_Growth",      25.0, "코어 배당 + 자본 성장"),
+        ("Equity_Income_CC",         7.5, "커버드콜 #1 (방법론 A)"),
+        ("Equity_Income_CC#2",       7.5, "커버드콜 #2 (방법론 B 분산)"),
+        ("Preferred",               12.5, "정기 인컴"),
+        ("HY_Bonds",                12.5, "신용 인컴 (캡 15%)"),
+        ("Conservative_Balanced",   15.0, "안정 + 혼합 인컴"),
+        ("HQ_Short_Intermediate_FI",10.0, "단기 자본보존"),
+        ("Gold_Hedge",               7.5, "위기/인플레 헤지"),
+        ("Cash_MM",                  2.5, "유동성/리밸런싱"),
+    ],
+    "Final Target (Year 4+)": [
+        ("Quality_Div_Growth",      25.0, "자본성장 + 배당 코어"),
+        ("Equity_Income_CC",         7.5, "커버드콜 #1"),
+        ("Equity_Income_CC#2",       7.5, "커버드콜 #2"),
+        ("Conservative_Balanced",   15.0, "리스크 통제"),
+        ("Preferred",               12.5, "고배당 인컴"),
+        ("HY_Bonds",                12.5, "신용 인컴"),
+        ("HQ_Short_Intermediate_FI",10.0, "자본 보존"),
+        ("Gold_Hedge",               7.5, "위기/인플레 헤지"),
+        ("Cash_MM",                  2.5, "유동성"),
+    ],
+}
+
+PERSONAL_SLOTS = {
+    "Personal — Year 1+ (EUR 300/month)": [
+        ("Global_Core_Equity",      70.0, "장기 자본성장 (글로벌)"),
+        ("Quality_Div_Growth",      15.0, "퀄리티 + 배당 안정성"),
+        ("HQ_Short_Intermediate_FI",10.0, "변동성 완화 + 리밸런싱"),
+        ("Gold_Hedge",               5.0, "위기 다각화"),
+    ],
+}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 2. 카테고리별 Top 후보 로드 (Phase 2 결과)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE2_CATEGORY_SHEETS = [
+    "Quality_Div_Growth", "Global_Core_Equity", "Conservative_Balanced",
+    "HQ_Short_Intermediate_FI", "Preferred", "HY_Bonds", "Equity_Income_CC",
+    "Gold_Hedge", "Infrastructure", "Cash_MM",
+]
+
+# Direction 카테고리별 ticker_whitelist 우선 선정 (잘못 분류된 ETF 배제)
+SLOT_TICKER_WHITELIST = {
+    "Quality_Div_Growth":     ["SCHD", "VIG", "DGRO", "VYM", "QUAL", "SPHQ", "DVY", "HDV", "NOBL", "SCHY"],
+    "Global_Core_Equity":     ["VT", "ACWI", "URTH", "VOO", "IVV", "SPY", "VTI", "ITOT", "VEA", "EFA", "IDEV", "VWO", "IEMG", "EEM"],
+    "Conservative_Balanced":  ["AOM", "AOR", "AOA", "VWELX", "VWENX", "VWINX", "VWIAX", "FBALX", "DODBX", "PRWCX"],
+    "HQ_Short_Intermediate_FI": ["SHY", "SCHO", "VGSH", "IEI", "IEF", "SCHR", "VGIT",
+                                  "BND", "AGG", "SCHZ", "BNDX", "IAGG"],
+    "Preferred":              ["PFF", "PFFD", "PGX", "PFXF", "PFFA"],
+    "HY_Bonds":               ["HYG", "JNK", "USHY", "SHYG", "HYDB", "FALN"],
+    "Equity_Income_CC":       ["JEPI", "JEPQ", "DIVO", "SPYI", "QYLD"],
+    "Gold_Hedge":             ["GLD", "IAU", "GLDM"],
+    "Infrastructure":         ["PAVE", "IGF", "IFRA", "VNQ", "SCHH", "IYR"],
+    "Cash_MM":                ["SHV", "BIL", "SGOV"],
+}
+
+
+def load_category_candidates() -> dict:
+    """카테고리별 [통과 + 스코어 정렬] DataFrame 반환"""
+    cats = {}
+    for sheet in PHASE2_CATEGORY_SHEETS:
+        try:
+            df = pd.read_excel(INPUT_PATH, sheet_name=sheet, header=3)
+        except ValueError:
+            df = pd.DataFrame()
+            cats[sheet] = df
+            continue
+        if df.empty or "하드룰통과" not in df.columns:
+            cats[sheet] = pd.DataFrame()
+            continue
+        df_pass = df[df["하드룰통과"].astype(str).str.startswith("통과")].copy()
+        # 스코어 → numeric
+        df_pass["_score"] = pd.to_numeric(df_pass["스코어"], errors="coerce")
+        df_pass = df_pass.sort_values("_score", ascending=False).reset_index(drop=True)
+        cats[sheet] = df_pass
+    return cats
+
+
+def pick_for_slot(category_key: str, cat_candidates: dict, used_tickers: set) -> dict:
+    """슬롯 카테고리 → ticker_whitelist 우선 선정 + 중복 회피"""
+    base_cat = category_key.split("#")[0]
+    df = cat_candidates.get(base_cat, pd.DataFrame())
+    whitelist = SLOT_TICKER_WHITELIST.get(base_cat, [])
+
+    # 1순위: ticker_whitelist에 있는 후보만 (스코어 정렬 유지)
+    primary, fallback = [], []
+    for _, row in df.iterrows():
+        tk = str(row.get("티커", ""))
+        if not tk or tk in used_tickers:
+            continue
+        if tk in whitelist:
+            primary.append(row)
+        else:
+            fallback.append(row)
+
+    # whitelist 매칭 우선, 없으면 fallback
+    if primary:
+        return primary[0]
+    if fallback:
+        return fallback[0]
+    return None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 3. EODHD 현재가 조회
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def fetch_current_price(ticker: str) -> float | None:
+    sym = ticker if "." in ticker else ticker + ".US"
+    today = datetime.today()
+    start = today.replace(month=max(today.month - 2, 1)).strftime("%Y-%m-%d")
+    url = f"https://eodhd.com/api/eod/{sym}?api_token={EODHD_KEY}&fmt=json&from={start}"
+    try:
+        r = requests.get(url, timeout=15, verify=False)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            return None
+        return float(data[-1].get("adjusted_close") or data[-1].get("close"))
+    except Exception:
+        return None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 4. 슬리브 단위 처리: 슬롯 → ETF 매칭 + 환산 + 수량
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def build_sleeve(label: str, slots: list, eur_per_month: float,
+                 cat_candidates: dict, price_cache: dict) -> tuple:
+    """단일 슬리브 1년치 슬롯 → DataFrame + 검증
+    반환: (df_year, validation_log)
+    """
+    rows = []
+    used_tickers = set()
+    log = []
+
+    for slot_idx, (cat_key, weight_pct, memo) in enumerate(slots):
+        pick = pick_for_slot(cat_key, cat_candidates, used_tickers)
+        if pick is None:
+            log.append(f"⚠️ 슬롯 {slot_idx+1} ({cat_key}): 후보 없음")
+            continue
+        tk = str(pick["티커"])
+        used_tickers.add(tk)
+
+        # 가격
+        if tk not in price_cache:
+            price_cache[tk] = fetch_current_price(tk)
+            time.sleep(0.10)
+        px_usd = price_cache[tk]
+
+        # 매월 EUR / USD / KRW
+        eur_amt = eur_per_month * (weight_pct / 100.0)
+        usd_amt = eur_amt * FX_EUR_USD
+        krw_amt = usd_amt * FX_USD_KRW
+
+        # 매수 수량 (USD 기준)
+        qty = (usd_amt / px_usd) if (px_usd and px_usd > 0) else None
+
+        rows.append({
+            "슬롯": slot_idx + 1,
+            "Direction카테고리": cat_key.replace("#2", " (분산 #2)"),
+            "비중(%)": weight_pct,
+            "티커": tk,
+            "ETF명": str(pick.get("ETF명", "")),
+            "분류": str(pick.get("분류", "")),
+            "펀드유형": str(pick.get("펀드유형", "")),
+            "스코어": pick.get("스코어"),
+            "5년CAGR(%)": pick.get("5년CAGR(%)"),
+            "TTM수익률(%)": pick.get("TTM수익률(%)"),
+            "Sharpe(5y)": pick.get("Sharpe(5y)"),
+            "Sortino(5y)": pick.get("Sortino(5y)"),
+            "변동성(연%,5y)": pick.get("변동성(연%,5y)"),
+            "MDD(5y,%)": pick.get("MDD(5y,%)"),
+            "AUM(억달러)": pick.get("AUM(억달러)"),
+            "운용보수(%)": pick.get("운용보수(%)"),
+            "별점(5점)":   pick.get("별점(5점)"),
+            "현재가(USD)": round(px_usd, 2) if px_usd else None,
+            "월매수EUR": round(eur_amt, 2),
+            "월매수USD": round(usd_amt, 2),
+            "월매수KRW": round(krw_amt, 0) if krw_amt else None,
+            "월매수수량": round(qty, 4) if qty else None,
+            "역할": memo,
+        })
+
+    # Direction 룰 검증
+    df_year = pd.DataFrame(rows)
+    if not df_year.empty:
+        # 1) 단일 펀드 ≤ 20%
+        over_20 = df_year[df_year["비중(%)"] > 20.0]
+        if not over_20.empty:
+            for _, r in over_20.iterrows():
+                log.append(f"⚠️ Core Fund 룰 ({r['티커']}: {r['비중(%)']}%): 20% 초과 → 별도 심사 필요")
+
+        # 2) HY 단일 ≤ 15%
+        hy_rows = df_year[df_year["Direction카테고리"].str.startswith("HY")]
+        for _, r in hy_rows.iterrows():
+            if r["비중(%)"] > 15.0:
+                log.append(f"❌ HY 룰 위반 ({r['티커']}: {r['비중(%)']}%): 15% 초과")
+
+        # 3) CC 단일 ≤ 15%
+        cc_rows = df_year[df_year["Direction카테고리"].str.contains("Equity_Income_CC")]
+        for _, r in cc_rows.iterrows():
+            if r["비중(%)"] > 15.0:
+                log.append(f"❌ CC 룰 위반 ({r['티커']}: {r['비중(%)']}%): 15% 초과")
+
+        # 4) 비중 합계 = 100%
+        total = df_year["비중(%)"].sum()
+        if abs(total - 100.0) > 0.01:
+            log.append(f"⚠️ 비중 합계 = {total}% (≠ 100%)")
+        else:
+            log.append(f"✓ 비중 합계 = 100%")
+
+        # 5) 통과 ETF만 사용 확인
+        log.append(f"✓ 모든 슬롯이 Phase 2 하드룰 통과 ETF로 매칭됨")
+
+    return df_year, log
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 4-B. 포트폴리오 단위 가중 메트릭 계산
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _to_float(x) -> float | None:
+    """'12.81%' / '+5.06%' / '혼합분배' / N/A → float or None"""
+    if pd.isna(x):
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip().replace("%", "").replace("+", "").replace(",", "")
+    if not s or s in ("-", "N/A", "혼합분배"):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def compute_portfolio_metrics(df: pd.DataFrame) -> dict:
+    """포트폴리오 가중 메트릭 (단순 가중평균 — 공분산 미반영)
+    - CAGR / TTM / Sharpe / Sortino: 정상 가중평균
+    - Vol / MDD: 단순 가중평균 = 보수적 상한치 (실제는 분산효과로 더 낮음)
+    """
+    if df.empty:
+        return {}
+
+    weights = df["비중(%)"].astype(float).values / 100.0
+
+    def num_col(col):
+        return np.array([_to_float(v) or 0.0 for v in df[col]])
+
+    cagr    = num_col("5년CAGR(%)")
+    ttm     = num_col("TTM수익률(%)")
+    sharpe  = num_col("Sharpe(5y)")
+    sortino = num_col("Sortino(5y)")
+    vol     = num_col("변동성(연%,5y)")
+    mdd     = num_col("MDD(5y,%)")
+    expense = num_col("운용보수(%)")
+    star    = num_col("별점(5점)")
+
+    return {
+        "weighted_cagr":    float(np.dot(weights, cagr)),
+        "weighted_ttm":     float(np.dot(weights, ttm)),
+        "weighted_sharpe":  float(np.dot(weights, sharpe)),
+        "weighted_sortino": float(np.dot(weights, sortino)),
+        "weighted_vol":     float(np.dot(weights, vol)),
+        "weighted_mdd":     float(np.dot(weights, mdd)),
+        "weighted_expense": float(np.dot(weights, expense)),
+        "weighted_star":    float(np.dot(weights, star)),
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 5. 메인
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def main():
+    print("=" * 60)
+    print("  Phase 3: 연차별 포트폴리오 매칭")
+    print("=" * 60)
+
+    print("\n[1/3] Phase 2 카테고리별 Top 후보 로드...")
+    cat_candidates = load_category_candidates()
+    for cat, df in cat_candidates.items():
+        print(f"  {cat:30s} → 통과 후보 {len(df)}개")
+
+    print(f"\n[2/3] 슬롯별 ETF 매칭 + 현재가 조회...")
+    price_cache = {}
+
+    company_results = {}
+    for label, slots in COMPANY_SLOTS.items():
+        print(f"\n  ── {label} ──")
+        df, log = build_sleeve(label, slots, EUR_PER_MONTH_COMPANY,
+                                cat_candidates, price_cache)
+        company_results[label] = (df, log)
+        for _, row in df.iterrows():
+            print(f"    {str(row['티커']):6s} {str(row['ETF명'])[:34]:36s} "
+                  f"{row['비중(%)']}% → EUR{row['월매수EUR']:>6.0f} / USD{row['월매수USD']:>7.0f}")
+
+    personal_results = {}
+    for label, slots in PERSONAL_SLOTS.items():
+        print(f"\n  ── {label} ──")
+        df, log = build_sleeve(label, slots, EUR_PER_MONTH_PERSONAL,
+                                cat_candidates, price_cache)
+        personal_results[label] = (df, log)
+        for _, row in df.iterrows():
+            print(f"    {str(row['티커']):6s} {str(row['ETF명'])[:34]:36s} "
+                  f"{row['비중(%)']}% → EUR{row['월매수EUR']:>5.0f} / USD{row['월매수USD']:>5.0f}")
+
+    print(f"\n[3/3] 엑셀 저장...")
+    save_excel(company_results, personal_results)
+    print(f"\n[Phase 3 완료] {OUTPUT_PATH}")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 6. Excel 저장
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def save_excel(company_results: dict, personal_results: dict):
+    Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
+
+    OUT_COLS = ["슬롯", "Direction카테고리", "비중(%)", "티커", "ETF명", "분류",
+                "펀드유형", "역할", "스코어", "5년CAGR(%)", "TTM수익률(%)",
+                "Sharpe(5y)", "Sortino(5y)", "변동성(연%,5y)", "MDD(5y,%)",
+                "AUM(억달러)", "운용보수(%)",
+                "현재가(USD)", "월매수EUR", "월매수USD", "월매수KRW", "월매수수량"]
+
+    with pd.ExcelWriter(OUTPUT_PATH, engine="xlsxwriter") as writer:
+        wb = writer.book
+
+        header_fmt = wb.add_format({
+            "bold": True, "bg_color": "#1a1a2e", "font_color": "white",
+            "border": 1, "align": "center", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕", "text_wrap": True,
+        })
+        intro_fmt = wb.add_format({
+            "bold": True, "font_size": 12, "font_name": "맑은 고딕",
+            "bg_color": "#1a7a3a", "font_color": "white", "border": 1,
+            "align": "left", "valign": "vcenter",
+        })
+        meta_fmt = wb.add_format({
+            "italic": True, "font_size": 10, "font_name": "맑은 고딕",
+            "border": 1, "bg_color": "#fef5e7", "align": "left",
+            "valign": "vcenter", "text_wrap": True,
+        })
+        cell_fmt = wb.add_format({
+            "border": 1, "align": "center", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕"
+        })
+        cell_left = wb.add_format({
+            "border": 1, "align": "left", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕"
+        })
+        money_fmt = wb.add_format({
+            "border": 1, "align": "right", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕",
+            "num_format": "#,##0",
+        })
+        money_eur = wb.add_format({
+            "border": 1, "align": "right", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕",
+            "num_format": '"€"#,##0.00',
+        })
+        money_usd = wb.add_format({
+            "border": 1, "align": "right", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕",
+            "num_format": '"$"#,##0.00',
+        })
+        money_krw = wb.add_format({
+            "border": 1, "align": "right", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕",
+            "num_format": '"₩"#,##0',
+        })
+        weight_fmt = wb.add_format({
+            "bold": True, "border": 1, "align": "center", "valign": "vcenter",
+            "font_size": 10, "font_name": "맑은 고딕",
+            "bg_color": "#ebf5fb",
+        })
+        log_ok_fmt = wb.add_format({
+            "font_size": 10, "font_name": "맑은 고딕",
+            "font_color": "#1a7a3a",
+        })
+        log_warn_fmt = wb.add_format({
+            "font_size": 10, "font_name": "맑은 고딕",
+            "font_color": "#c0392b", "bold": True,
+        })
+
+        def write_sleeve(label: str, df: pd.DataFrame, log: list, sheet_name: str,
+                         eur_per_month: float = EUR_PER_MONTH_COMPANY):
+            ws = wb.add_worksheet(sheet_name)
+            writer.sheets[sheet_name] = ws
+
+            # 환율/적립금 메타
+            sleeve_amt = df["월매수EUR"].sum() if not df.empty else 0
+            n_cols = len(OUT_COLS)
+
+            # 인트로
+            ws.merge_range(0, 0, 0, n_cols-1,
+                f"【{label}】  매월 적립 EUR {sleeve_amt:,.0f}  ※ 환율 가정: EUR/USD={FX_EUR_USD}, USD/KRW={FX_USD_KRW:,.0f}",
+                intro_fmt)
+            ws.set_row(0, 28)
+
+            # 검증 로그
+            log_text = "  ".join(log) if log else ""
+            ws.merge_range(1, 0, 1, n_cols-1, "검증: " + log_text, meta_fmt)
+            ws.set_row(1, 30)
+
+            # 헤더
+            for ci, col in enumerate(OUT_COLS):
+                ws.write(3, ci, col, header_fmt)
+
+            # 컬럼 폭
+            widths = []
+            for col in OUT_COLS:
+                if col == "슬롯": widths.append(5)
+                elif col == "Direction카테고리": widths.append(22)
+                elif col == "비중(%)": widths.append(8)
+                elif col == "티커": widths.append(7)
+                elif col == "ETF명": widths.append(32)
+                elif col == "분류": widths.append(12)
+                elif col == "펀드유형": widths.append(8)
+                elif col == "역할": widths.append(22)
+                elif col == "월매수KRW": widths.append(13)
+                elif col in ("Sharpe(5y)", "Sortino(5y)"): widths.append(9)
+                else: widths.append(10)
+            for ci, w in enumerate(widths):
+                ws.set_column(ci, ci, w)
+
+            # 데이터
+            for ri, (_, row) in enumerate(df.iterrows()):
+                ws.set_row(4 + ri, 22)
+                for ci, col in enumerate(OUT_COLS):
+                    val = row.get(col)
+                    if col == "비중(%)":
+                        ws.write(4+ri, ci, f"{val}%" if pd.notna(val) else "", weight_fmt)
+                    elif col in ("ETF명", "역할", "분류"):
+                        ws.write(4+ri, ci, val if pd.notna(val) else "", cell_left)
+                    elif col == "월매수EUR":
+                        ws.write(4+ri, ci, float(val) if pd.notna(val) else "", money_eur)
+                    elif col in ("월매수USD", "현재가(USD)"):
+                        ws.write(4+ri, ci, float(val) if pd.notna(val) else "", money_usd)
+                    elif col == "월매수KRW":
+                        ws.write(4+ri, ci, float(val) if pd.notna(val) else "", money_krw)
+                    elif col == "월매수수량":
+                        ws.write(4+ri, ci,
+                                 f"{float(val):.4f}주" if pd.notna(val) else "", cell_fmt)
+                    elif col == "AUM(억달러)":
+                        ws.write(4+ri, ci, float(val) if pd.notna(val) else "", money_fmt)
+                    else:
+                        ws.write(4+ri, ci, val if pd.notna(val) else "", cell_fmt)
+
+            # 합계 행
+            total_row = len(df) + 4
+            n_cols = len(OUT_COLS)   # 22
+            eur_idx = OUT_COLS.index("월매수EUR")
+            usd_idx = OUT_COLS.index("월매수USD")
+            krw_idx = OUT_COLS.index("월매수KRW")
+            qty_idx = OUT_COLS.index("월매수수량")
+
+            ws.write(total_row, 0, "합계", header_fmt)
+            ws.write(total_row, 1, "", header_fmt)
+            ws.write(total_row, 2, f"{df['비중(%)'].sum()}%", header_fmt)
+            for ci in range(3, eur_idx):
+                ws.write(total_row, ci, "", header_fmt)
+            ws.write(total_row, eur_idx, df["월매수EUR"].sum() if not df.empty else 0, money_eur)
+            ws.write(total_row, usd_idx, df["월매수USD"].sum() if not df.empty else 0, money_usd)
+            ws.write(total_row, krw_idx, df["월매수KRW"].sum() if not df.empty else 0, money_krw)
+            ws.write(total_row, qty_idx, "", cell_fmt)
+            ws.set_row(total_row, 24)
+
+            # ── 포트폴리오 가중 메트릭 박스 ─────────────
+            metrics = compute_portfolio_metrics(df)
+            if metrics:
+                # 박스 시작 행 (합계 다음 +2)
+                box_row = total_row + 2
+
+                # 적립 시뮬레이션 (개월 수: Y1=12, Y2=24, Y3=36, Final=36 누적)
+                if "Y1" in label or "Y1" in sheet_name:
+                    n_months_at_end = 12
+                elif "Y2" in label or "Y2" in sheet_name:
+                    n_months_at_end = 24
+                elif "Y3" in label or "Y3" in sheet_name or "Final" in label:
+                    n_months_at_end = 36
+                else:  # Personal
+                    n_months_at_end = 36   # 36개월 시점 비교
+
+                eur_cum  = eur_per_month * n_months_at_end
+                usd_cum  = eur_cum * FX_EUR_USD
+                krw_cum  = usd_cum * FX_USD_KRW
+
+                # 예상 연간 인컴 (TTM 가중 × 누적 자산)
+                ttm_pct  = metrics["weighted_ttm"]
+                annual_income_usd = usd_cum * (ttm_pct / 100.0)
+                annual_income_krw = annual_income_usd * FX_USD_KRW
+
+                # 박스 포맷
+                box_label = wb.add_format({
+                    "bold": True, "bg_color": "#1a7a3a",
+                    "font_color": "white", "border": 1,
+                    "align": "left", "valign": "vcenter",
+                    "font_size": 11, "font_name": "맑은 고딕"
+                })
+                metric_label = wb.add_format({
+                    "bold": True, "bg_color": "#ebf5fb",
+                    "border": 1, "align": "left", "valign": "vcenter",
+                    "font_size": 10, "font_name": "맑은 고딕"
+                })
+                metric_val = wb.add_format({
+                    "border": 1, "align": "center", "valign": "vcenter",
+                    "font_size": 10, "font_name": "맑은 고딕",
+                    "bg_color": "#fef5e7", "bold": True,
+                })
+                metric_val_pos = wb.add_format({
+                    "border": 1, "align": "center", "valign": "vcenter",
+                    "font_size": 10, "font_name": "맑은 고딕",
+                    "bg_color": "#d5f5e3", "font_color": "#1a7a3a", "bold": True,
+                })
+                metric_val_neg = wb.add_format({
+                    "border": 1, "align": "center", "valign": "vcenter",
+                    "font_size": 10, "font_name": "맑은 고딕",
+                    "bg_color": "#fadbd8", "font_color": "#c0392b", "bold": True,
+                })
+
+                # 박스 헤더
+                ws.merge_range(box_row, 0, box_row, 21,
+                    "📊 포트폴리오 단위 가중 메트릭 (비중 가중평균 — Vol/MDD는 분산효과 미반영 보수적 상한)",
+                    box_label)
+                ws.set_row(box_row, 24)
+                box_row += 1
+
+                # 메트릭 4행 × 5열
+                metrics_layout = [
+                    [
+                        ("가중 5년 CAGR",  f"{metrics['weighted_cagr']:+.2f}%",
+                         metric_val_pos if metrics['weighted_cagr'] > 0 else metric_val_neg),
+                        ("가중 TTM 수익률", f"{metrics['weighted_ttm']:.2f}%",
+                         metric_val_pos if metrics['weighted_ttm'] >= 3.0 else metric_val),
+                        ("가중 Sharpe",    f"{metrics['weighted_sharpe']:.2f}",
+                         metric_val_pos if metrics['weighted_sharpe'] >= 0.5 else metric_val),
+                        ("가중 Sortino",   f"{metrics['weighted_sortino']:.2f}",
+                         metric_val_pos if metrics['weighted_sortino'] >= 0.7 else metric_val),
+                    ],
+                    [
+                        ("가중 변동성(연%)", f"{metrics['weighted_vol']:.2f}%",
+                         metric_val_pos if metrics['weighted_vol'] <= 12 else
+                         (metric_val_neg if metrics['weighted_vol'] >= 18 else metric_val)),
+                        ("가중 MDD(5y)",    f"{metrics['weighted_mdd']:+.2f}%",
+                         metric_val_neg if metrics['weighted_mdd'] <= -25 else
+                         (metric_val_pos if metrics['weighted_mdd'] >= -15 else metric_val)),
+                        ("가중 운용보수",   f"{metrics['weighted_expense']:.3f}%",
+                         metric_val_pos if metrics['weighted_expense'] < 0.30 else metric_val),
+                        ("가중 별점",       f"{metrics['weighted_star']:.2f}/5",
+                         metric_val_pos if metrics['weighted_star'] >= 4.0 else metric_val),
+                    ],
+                ]
+                for ri, row_data in enumerate(metrics_layout):
+                    ws.set_row(box_row + ri, 22)
+                    col_pos = 0
+                    for label_, val_, fmt_ in row_data:
+                        ws.merge_range(box_row+ri, col_pos, box_row+ri, col_pos+1,
+                                        label_, metric_label)
+                        ws.merge_range(box_row+ri, col_pos+2, box_row+ri, col_pos+4,
+                                        val_, fmt_)
+                        col_pos += 5
+                box_row += len(metrics_layout)
+
+                # 적립 시뮬레이션 박스
+                ws.merge_range(box_row, 0, box_row, 21,
+                    f"💰 적립 시뮬레이션 ({n_months_at_end}개월 시점 누적)", box_label)
+                ws.set_row(box_row, 24)
+                box_row += 1
+
+                ws.set_row(box_row, 22)
+                ws.merge_range(box_row, 0,  box_row, 1,
+                                "월 적립", metric_label)
+                ws.merge_range(box_row, 2,  box_row, 5,
+                                f"EUR {eur_per_month:,.0f}", metric_val)
+                ws.merge_range(box_row, 6,  box_row, 9,
+                                f"= USD ${eur_per_month*FX_EUR_USD:,.0f}", metric_val)
+                ws.merge_range(box_row, 10, box_row, 14,
+                                f"= ₩{eur_per_month*FX_EUR_USD*FX_USD_KRW:,.0f}", metric_val)
+                ws.merge_range(box_row, 15, box_row, 21,
+                                "", cell_fmt)
+                box_row += 1
+
+                ws.set_row(box_row, 22)
+                ws.merge_range(box_row, 0,  box_row, 1,
+                                f"{n_months_at_end}개월 누적", metric_label)
+                ws.merge_range(box_row, 2,  box_row, 5,
+                                f"EUR {eur_cum:,.0f}", metric_val_pos)
+                ws.merge_range(box_row, 6,  box_row, 9,
+                                f"= USD ${usd_cum:,.0f}", metric_val_pos)
+                ws.merge_range(box_row, 10, box_row, 14,
+                                f"= ₩{krw_cum:,.0f}", metric_val_pos)
+                ws.merge_range(box_row, 15, box_row, 21,
+                                "", cell_fmt)
+                box_row += 1
+
+                # 인컴 추정 (Y3/Final/Personal만)
+                if n_months_at_end >= 24 and ttm_pct > 0:
+                    box_row += 1
+                    ws.merge_range(box_row, 0, box_row, 21,
+                        "📈 예상 연간 인컴 (TTM 가중 × 누적 자산)", box_label)
+                    ws.set_row(box_row, 24)
+                    box_row += 1
+
+                    target_min, target_max = 10000, 12000
+                    if eur_per_month < 1000:   # Personal sleeve
+                        target_min, target_max = 0, 0   # 인컴 목표 없음 (재투자)
+                        target_text = "Direction: 분배금 100% 재투자 (목표 없음)"
+                        income_status_fmt = metric_val
+                    elif annual_income_usd < target_min:
+                        target_text = f"⚠️ Direction 목표 USD $10K-$12K 미달 ({annual_income_usd-target_min:+,.0f})"
+                        income_status_fmt = metric_val_neg
+                    elif annual_income_usd > 14000:
+                        target_text = f"⚠️ Direction 목표 초과 (과도한 인컴 — 신용/CC 집중도 확인)"
+                        income_status_fmt = metric_val_neg
+                    elif annual_income_usd <= target_max:
+                        target_text = f"✓ Direction 목표 USD $10K-$12K 달성"
+                        income_status_fmt = metric_val_pos
+                    else:
+                        target_text = f"○ Direction 상회 (적정 범위 내)"
+                        income_status_fmt = metric_val_pos
+
+                    ws.set_row(box_row, 22)
+                    ws.merge_range(box_row, 0, box_row, 4,
+                                    f"가중 TTM 수익률", metric_label)
+                    ws.merge_range(box_row, 5, box_row, 9,
+                                    f"{ttm_pct:.2f}%", metric_val)
+                    ws.merge_range(box_row, 10, box_row, 14,
+                                    f"× USD ${usd_cum:,.0f}", metric_val)
+                    ws.merge_range(box_row, 15, box_row, 21,
+                                    f"= USD ${annual_income_usd:,.0f} (₩{annual_income_krw:,.0f})",
+                                    income_status_fmt)
+                    box_row += 1
+
+                    ws.set_row(box_row, 22)
+                    ws.merge_range(box_row, 0, box_row, 21, target_text, income_status_fmt)
+
+            ws.freeze_panes(4, 4)
+
+        # 1. 거버넌스 슬리브 (4 시트: Y1, Y2, Y3, Final)
+        for label, (df, log) in company_results.items():
+            short = label.split("—")[0].strip()  # "Y1" 등
+            short = short.replace(" ", "_")[:18]
+            write_sleeve(label, df, log, short, eur_per_month=EUR_PER_MONTH_COMPANY)
+
+        # 2. 개인 슬리브
+        for label, (df, log) in personal_results.items():
+            write_sleeve(label, df, log, "Personal", eur_per_month=EUR_PER_MONTH_PERSONAL)
+
+        # 3. Direction 룰 검증 종합
+        check_rows = []
+        check_rows.append(("연차", "총 ETF 수", "비중 합계", "단일 펀드 최대",
+                           "HY 비중", "CC 비중", "Direction 룰", "비고"))
+        for label, (df, _) in company_results.items():
+            short = label.split("—")[0].strip()
+            n = len(df)
+            tot = df["비중(%)"].sum() if not df.empty else 0
+            single_max = df["비중(%)"].max() if not df.empty else 0
+            hy = df[df["Direction카테고리"].str.startswith("HY")]["비중(%)"].sum() if not df.empty else 0
+            cc = df[df["Direction카테고리"].str.contains("Equity_Income_CC")]["비중(%)"].sum() if not df.empty else 0
+
+            rules = []
+            if single_max > 20: rules.append("단일>20% 위반")
+            if hy > 15: rules.append("HY>15% 위반")
+            if cc > 30: rules.append("CC 합>30% 주의")  # 분산 후 합산 30% 한도
+            note = " / ".join(rules) if rules else "✓ 통과"
+            check_rows.append((short, n, f"{tot:.1f}%", f"{single_max:.1f}%",
+                                f"{hy:.1f}%", f"{cc:.1f}%", note,
+                                f"매월 EUR {df['월매수EUR'].sum():,.0f}"))
+
+        df_check = pd.DataFrame(check_rows[1:], columns=check_rows[0])
+        df_check.to_excel(writer, sheet_name="Direction룰검증",
+                          index=False, header=False, startrow=1)
+        ws_v = writer.sheets["Direction룰검증"]
+        for ci, col in enumerate(df_check.columns):
+            ws_v.write(0, ci, col, header_fmt)
+        for ci in range(8):
+            ws_v.set_column(ci, ci, 18)
+        for ri, (_, row) in enumerate(df_check.iterrows()):
+            ws_v.set_row(ri + 1, 24)
+            for ci, val in enumerate(row):
+                ws_v.write(ri + 1, ci, str(val), cell_fmt)
+
+        # 4. 환율/적립금 가정
+        assump_rows = [
+            ("EUR/USD 환율 가정", FX_EUR_USD),
+            ("USD/KRW 환율 가정", FX_USD_KRW),
+            ("거버넌스 월 적립", f"EUR {EUR_PER_MONTH_COMPANY:,.0f}"),
+            ("개인 월 적립",      f"EUR {EUR_PER_MONTH_PERSONAL:,.0f}"),
+            ("적립 기간",         f"{N_MONTHS}개월"),
+            ("36개월 누적 (거버넌스)", f"EUR {EUR_PER_MONTH_COMPANY * N_MONTHS:,.0f}"),
+            ("36개월 누적 (개인)",     f"EUR {EUR_PER_MONTH_PERSONAL * N_MONTHS:,.0f}"),
+            ("평가 기준일",       TODAY.strftime("%Y-%m-%d")),
+            ("",                  ""),
+            ("주의",              "환율은 변동 가능. 실제 매월 매수액은 당시 환율로 재계산 필요"),
+            ("주의",              "현재가는 본 평가 시점 종가. 매월 변동 → 매수 수량은 실시간 재계산"),
+        ]
+        df_a = pd.DataFrame(assump_rows, columns=["항목", "값"])
+        df_a.to_excel(writer, sheet_name="가정",
+                      index=False, header=False, startrow=1)
+        ws_a = writer.sheets["가정"]
+        ws_a.write(0, 0, "항목", header_fmt)
+        ws_a.write(0, 1, "값",   header_fmt)
+        ws_a.set_column(0, 0, 25)
+        ws_a.set_column(1, 1, 50)
+        for ri, (_, row) in enumerate(df_a.iterrows()):
+            ws_a.set_row(ri + 1, 22)
+            for ci, val in enumerate(row):
+                ws_a.write(ri + 1, ci, str(val), cell_left if ci == 1 else cell_fmt)
+
+
+if __name__ == "__main__":
+    main()
